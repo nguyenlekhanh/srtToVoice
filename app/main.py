@@ -14,10 +14,12 @@ Run with the project's .venv:
 
 from __future__ import annotations
 
+import queue
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from app.voice_library import (
     NO_VOICES_MESSAGE,
@@ -25,12 +27,22 @@ from app.voice_library import (
     filter_voices,
     scan_voices,
 )
+from app.voice_preview import (
+    PREVIEW_TEXT,
+    PreviewError,
+    generate_preview,
+    is_valid_wav,
+    play_wav_blocking,
+    preview_cache_path,
+    stop_sound,
+)
 
-APP_TITLE = "Local Video Editor — Phase 1 (Voice Library)"
+APP_TITLE = "Local Video Editor — Phase 2 (Voice Preview)"
 COMING_SOON = "Coming in next phases"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VOICES_ROOT = PROJECT_ROOT / "voices"
+PREVIEWS_DIR = PROJECT_ROOT / "generated" / "previews"
 
 BG = "#f2f2f2"
 PANEL_BG = "#ffffff"
@@ -52,9 +64,38 @@ class App(tk.Tk):
         self.selected_voice: Optional[Voice] = None
         self.search_var = tk.StringVar()
 
+        # Phase 2 preview state (generation + playback).
+        self._preview_token = 0  # invalidates stale async callbacks
+        self._generating = False
+        self._playing = False
+        # Thread-safe handoff: worker threads enqueue callbacks here and
+        # the Tkinter main thread executes them via _poll_ui_queue().
+        self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
+
         self._build_layout()
 
         self._refresh_voices(initial=True)
+        self.after(50, self._poll_ui_queue)
+
+    # ------------------------------------------- thread-safe UI updates
+
+    def _run_on_ui_thread(self, callback: Callable[[], None]) -> None:
+        """Schedule ``callback`` to run on the Tkinter main thread."""
+        self._ui_queue.put(callback)
+
+    def _poll_ui_queue(self) -> None:
+        """Execute queued worker callbacks on the main thread."""
+        try:
+            while True:
+                callback = self._ui_queue.get_nowait()
+                try:
+                    callback()
+                except Exception:
+                    # Never let a bad callback kill the polling loop.
+                    pass
+        except queue.Empty:
+            pass
+        self.after(50, self._poll_ui_queue)
 
     # ------------------------------------------------------------------ UI
 
@@ -122,7 +163,7 @@ class App(tk.Tk):
         voice = ttk.LabelFrame(parent, text="Voice Library", padding=8)
         voice.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         voice.columnconfigure(0, weight=1)
-        voice.rowconfigure(3, weight=1)
+        voice.rowconfigure(5, weight=1)
 
         # Search / filter
         search_row = ttk.Frame(voice)
@@ -148,9 +189,28 @@ class App(tk.Tk):
         )
         self.selected_label.grid(row=2, column=0, sticky="ew", pady=(8, 4))
 
+        # Phase 2: preview controls
+        preview_row = ttk.Frame(voice)
+        preview_row.grid(row=3, column=0, sticky="ew", pady=(2, 0))
+        preview_row.columnconfigure(0, weight=1)
+        preview_row.columnconfigure(1, weight=1)
+        self.preview_button = ttk.Button(
+            preview_row, text="Preview Voice", command=self._on_preview_voice
+        )
+        self.preview_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.stop_button = ttk.Button(
+            preview_row, text="Stop", command=self._on_stop_preview, state="disabled"
+        )
+        self.stop_button.grid(row=0, column=1, sticky="ew")
+
+        self.preview_status_label = ttk.Label(
+            voice, text="", foreground="#444444", wraplength=260, justify="left"
+        )
+        self.preview_status_label.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+
         # Scrollable voice list
         list_frame = ttk.Frame(voice)
-        list_frame.grid(row=3, column=0, sticky="nsew")
+        list_frame.grid(row=5, column=0, sticky="nsew")
         list_frame.rowconfigure(0, weight=1)
         list_frame.columnconfigure(0, weight=1)
 
@@ -293,6 +353,7 @@ class App(tk.Tk):
 
     def _select_voice(self, voice: Voice) -> None:
         """Store the selected voice in application state (no audio yet)."""
+        self._cancel_preview_if_active()
         self.selected_voice = voice
         self._update_selected_label()
         self._rebuild_voice_list()
@@ -313,6 +374,133 @@ class App(tk.Tk):
                 f"Model: {v.model_path}"
             )
         )
+
+    # ------------------------------------------------- Phase 2: preview
+
+    def _set_preview_status(self, message: str) -> None:
+        self.preview_status_label.configure(text=message)
+
+    def _set_preview_busy(self, busy: bool) -> None:
+        """Toggle button states for generating/playing vs idle."""
+        self.preview_button.configure(state="disabled" if busy else "normal")
+        self.stop_button.configure(state="normal" if busy else "disabled")
+
+    def _on_preview_voice(self) -> None:
+        """Generate (or reuse) a cached preview and play it."""
+        if self._generating or self._playing:
+            return
+        if self.selected_voice is None:
+            self._set_preview_status("No voice selected. Select a voice first.")
+            self._set_status("No voice selected. Select a voice first.")
+            return
+
+        voice = self.selected_voice
+        wav_path = preview_cache_path(voice.model_path, PREVIEWS_DIR)
+        self._preview_token += 1
+        token = self._preview_token
+
+        if wav_path.is_file() and is_valid_wav(wav_path):
+            # Cached preview exists: play it without invoking Piper again.
+            self._set_preview_status("Preview ready (cached)")
+            self._start_playback(token, wav_path, playing_status="Playing... (cached)")
+            return
+
+        # Generate in a background thread so the UI stays responsive.
+        self._generating = True
+        self._set_preview_busy(True)
+        self._set_preview_status("Generating preview...")
+        self._set_status(f"Generating preview for '{voice.name}'...")
+        worker = threading.Thread(
+            target=self._generate_worker,
+            args=(token, voice, wav_path),
+            daemon=True,
+        )
+        worker.start()
+
+    def _generate_worker(
+        self, token: int, voice: Voice, wav_path: Path
+    ) -> None:
+        """Background thread: run Piper, then report back to the UI."""
+        error: Optional[str] = None
+        try:
+            generate_preview(voice.model_path, voice.json_path, wav_path)
+        except PreviewError as exc:
+            error = str(exc)
+        except Exception:
+            error = "Preview generation failed."
+        self._run_on_ui_thread(
+            lambda: self._on_generation_done(token, wav_path, error)
+        )
+
+    def _on_generation_done(
+        self, token: int, wav_path: Path, error: Optional[str]
+    ) -> None:
+        self._generating = False
+        if token != self._preview_token:
+            return  # superseded by a newer preview request or Stop
+        if error is not None:
+            self._set_preview_busy(False)
+            self._set_preview_status(error)
+            self._set_status(error)
+            return
+        self._set_preview_status("Preview ready")
+        self._start_playback(token, wav_path)
+
+    def _start_playback(
+        self, token: int, wav_path: Path, playing_status: str = "Playing..."
+    ) -> None:
+        """Play the WAV in a background thread (winsound blocks)."""
+        self._playing = True
+        self._set_preview_busy(True)
+        self._set_preview_status(playing_status)
+        worker = threading.Thread(
+            target=self._playback_worker,
+            args=(token, wav_path),
+            daemon=True,
+        )
+        worker.start()
+
+    def _playback_worker(self, token: int, wav_path: Path) -> None:
+        error: Optional[str] = None
+        try:
+            play_wav_blocking(wav_path)
+        except PreviewError as exc:
+            error = str(exc)
+        except Exception:
+            error = "Playback failed."
+        self._run_on_ui_thread(lambda: self._on_playback_done(token, error))
+
+    def _on_playback_done(self, token: int, error: Optional[str]) -> None:
+        self._playing = False
+        if token != self._preview_token:
+            return  # stopped or superseded
+        self._set_preview_busy(False)
+        if error is not None:
+            self._set_preview_status(error)
+            self._set_status(error)
+        else:
+            self._set_preview_status("Preview ready")
+            self._set_status("Preview finished.")
+
+    def _on_stop_preview(self) -> None:
+        """Stop playback and cancel any in-flight preview request."""
+        self._preview_token += 1  # invalidate pending worker callbacks
+        self._generating = False
+        self._playing = False
+        stop_sound()
+        self._set_preview_busy(False)
+        self._set_preview_status("Stopped.")
+        self._set_status("Preview stopped.")
+
+    def _cancel_preview_if_active(self) -> None:
+        """Silently stop preview when the selected voice changes."""
+        if self._generating or self._playing:
+            self._preview_token += 1
+            self._generating = False
+            self._playing = False
+            stop_sound()
+            self._set_preview_busy(False)
+            self._set_preview_status("")
 
     def _build_preview(self, parent: ttk.Widget) -> None:
         # 3. Video Preview
