@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Local environment config
+.env
+
+# Runtime/generated assets
+output/**
+!output/.gitkeep
+temp/**
+!temp/.gitkeep
+projects/**
+!projects/.gitkeep
+
+# Local model files
+models/**
+!models/.gitkeep
+
+# Test/cache noise
+.pytest_cache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+bin/
+dist/
+build/
+voice_temp/
+*.gguf
+assets/luts/_archive
+log.txt
+data/*
+*.mp4
+recent_projects.json
+*.spec
+exports/
+generated/
+projects/
+voices/

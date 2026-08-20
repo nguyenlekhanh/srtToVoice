@@ -1,0 +1,7 @@
+# Phase 0 — project skeleton
+#
+# The UI uses tkinter, which ships with the standard Python installation
+# on Windows, so no third-party packages are required for this phase.
+#
+# Dependencies for later phases (Piper TTS, audio, subtitles, ...) will
+# be added here when those phases are implemented.
