@@ -1,13 +1,14 @@
-# Local Video Editor (Phase 2 — Piper Voice Preview)
+# Local Video Editor (Phase 3 — SRT Voice Generation)
 
 A local desktop application that will become a simple CapCut-like video
-editor with local Piper TTS. Phase 2 adds voice preview: the selected
-Piper voice synthesizes one fixed short sentence, caches the WAV in
-`generated/previews/`, and plays it back locally.
+editor with local Piper TTS. Phase 3 adds SRT voice generation: upload
+a SubRip file and generate exactly ONE complete WAV narration file with
+the currently selected Piper voice.
 
 ## Current status
 
-- **Media** — Upload Video / Upload SRT buttons (placeholders)
+- **Media** — WORKING: Upload SRT (file picker), Generate Voice, and an
+  Assets list with playable generated WAVs; Upload Video (placeholder)
 - **Voice Library** — WORKING: recursive scan of `voices/`, metadata
   display, search/filter, voice selection, refresh
 - **Voice Preview** — WORKING: generates and plays a short preview of
@@ -15,6 +16,35 @@ Piper voice synthesizes one fixed short sentence, caches the WAV in
 - **Video Preview** — empty preview area (placeholder)
 - **Timeline** — empty timeline area (placeholder)
 - **Export** — Export button (placeholder)
+
+## SRT Voice Generation (Phase 3)
+
+- `Upload SRT` opens a Windows file picker for `.srt` files; the chosen
+  filename is shown in the Media section. The original file is never
+  modified. Cancelling does nothing.
+- The SRT is parsed into plain narration text: subtitle numbers and
+  timestamps are removed, subtitle order and punctuation are kept,
+  multiline subtitle text is supported, and common markup tags
+  (`<i>`, `{\an8}`) are stripped. Timestamps are NOT timeline
+  instructions — they are only used to locate subtitle text.
+- `Generate Voice` requires a selected SRT and a selected voice;
+  otherwise a clear message is shown and Piper is not run.
+- The complete narration text is synthesized into exactly ONE WAV in
+  `generated/` (e.g. `voice_20260820_155500.wav`). Timestamp-based
+  names never overwrite previous files; regenerating with another voice
+  adds a new asset and keeps the old ones.
+- Piper runs as a subprocess (`python -m piper`) from the project
+  `.venv`, in a background worker thread; the UI stays responsive and
+  shows "Generating voice..." plus the elapsed time when done.
+- The temporary narration text file (under `generated/tmp/`) and any
+  partial `.part` WAV are always cleaned up; the final WAV is written
+  atomically.
+- Generated WAVs appear in the Media Assets list with a Play button
+  (local `winsound` playback) and a Stop button. Generated audio is
+  NOT placed on any timeline.
+- Errors (no SRT, no voice, missing/empty/malformed SRT, missing model,
+  Piper unavailable, generation failure, invalid output WAV) are shown
+  as concise messages — no raw tracebacks.
 
 ## Voice Preview (Phase 2)
 
@@ -34,7 +64,7 @@ Piper voice synthesizes one fixed short sentence, caches the WAV in
 
 - Windows
 - Python 3.12 (project `.venv` already exists, includes `piper-tts`)
-- No new third-party packages added in Phase 2
+- No new third-party packages added in Phase 3
 
 ## Folder structure
 
@@ -45,10 +75,12 @@ project/
 │   ├── __init__.py
 │   ├── main.py          # UI entry point
 │   ├── voice_library.py # voice scanning / metadata logic (no UI)
-│   └── voice_preview.py # Piper preview generation + playback (no UI)
+│   ├── voice_preview.py # Piper preview generation + playback (no UI)
+│   └── srt_voice.py     # SRT parsing + Piper WAV generation (no UI)
 ├── voices/         # Piper voice models (.onnx + .onnx.json), any nesting
 ├── generated/
-│   └── previews/   # cached preview WAVs (created on first preview)
+│   ├── previews/   # cached preview WAVs (created on first preview)
+│   └── tmp/        # temporary narration text files (auto-cleaned)
 ├── uploads/        # (future) uploaded videos / SRT files
 ├── projects/       # (future) saved project files
 ├── exports/        # (future) exported videos
@@ -66,7 +98,5 @@ From the project root:
 
 ## Roadmap (not implemented yet)
 
-- Full voice generation from SRT content (Phase 3+)
-- SRT parsing and upload
 - Video preview and timeline editing
 - FFmpeg export

@@ -1,12 +1,20 @@
-"""Phase 1 — Voice Library scanner for the local video editor.
+"""Local CapCut-like editor skeleton: Voice Library, Voice Preview and
+SRT voice generation.
 
 Tkinter UI with five sections: Media, Voice, Video Preview, Timeline,
-Export. Only the Voice section is functional in Phase 1: it scans the
-``voices/`` directory recursively for Piper ``.onnx`` + ``.onnx.json``
-pairs, shows their metadata, and lets the user select a voice.
+Export.
 
-No audio is generated yet. Media, Video Preview, Timeline and Export
-remain placeholders.
+- Phase 1: the Voice section scans the ``voices/`` directory
+  recursively for Piper ``.onnx`` + ``.onnx.json`` pairs, shows their
+  metadata, and lets the user select a voice.
+- Phase 2: the selected voice can be previewed (cached WAV generation
+  in ``generated/previews/`` plus local playback).
+- Phase 3: ``Upload SRT`` picks a SubRip file, ``Generate Voice``
+  synthesizes the complete subtitle text into exactly ONE WAV in
+  ``generated/`` using the selected Piper voice. The SRT timestamps
+  are only a text source — no timeline placement happens.
+
+Video Preview, Timeline and Export remain placeholders.
 
 Run with the project's .venv:
     .venv\\Scripts\\python.exe -m app.main
@@ -16,11 +24,18 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import filedialog, ttk
 from typing import Callable, List, Optional
 
+from app.srt_voice import (
+    SrtError,
+    generate_voice_wav,
+    new_voice_wav_path,
+    parse_srt_text,
+)
 from app.voice_library import (
     NO_VOICES_MESSAGE,
     Voice,
@@ -37,12 +52,13 @@ from app.voice_preview import (
     stop_sound,
 )
 
-APP_TITLE = "Local Video Editor — Phase 2 (Voice Preview)"
+APP_TITLE = "Local Video Editor — Phase 3 (SRT Voice Generation)"
 COMING_SOON = "Coming in next phases"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VOICES_ROOT = PROJECT_ROOT / "voices"
 PREVIEWS_DIR = PROJECT_ROOT / "generated" / "previews"
+GENERATED_DIR = PROJECT_ROOT / "generated"
 
 BG = "#f2f2f2"
 PANEL_BG = "#ffffff"
@@ -71,6 +87,13 @@ class App(tk.Tk):
         # Thread-safe handoff: worker threads enqueue callbacks here and
         # the Tkinter main thread executes them via _poll_ui_queue().
         self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
+
+        # Phase 3 state: selected SRT + generated voice assets.
+        self.srt_path: Optional[Path] = None
+        self.generated_wavs: List[Path] = []
+        self._voice_generating = False
+        self._voice_playing = False
+        self._voice_play_token = 0  # invalidates stale playback callbacks
 
         self._build_layout()
 
@@ -136,12 +159,35 @@ class App(tk.Tk):
         sidebar = ttk.Frame(parent)
         sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 8))
 
-        # 1. Media (unchanged placeholder)
+        # 1. Media (Phase 3: SRT upload + voice generation)
         media = self._section(sidebar, "Media")
         self._coming_soon_button(media, "Upload Video").pack(
             fill=tk.X, pady=2
         )
-        self._coming_soon_button(media, "Upload SRT").pack(fill=tk.X, pady=2)
+        ttk.Button(media, text="Upload SRT", command=self._on_upload_srt).pack(
+            fill=tk.X, pady=2
+        )
+        self.srt_label = ttk.Label(
+            media,
+            text="SRT: (none)",
+            foreground="#444444",
+            wraplength=260,
+            justify="left",
+        )
+        self.srt_label.pack(anchor="w", padx=2)
+        self.generate_voice_button = ttk.Button(
+            media, text="Generate Voice", command=self._on_generate_voice
+        )
+        self.generate_voice_button.pack(fill=tk.X, pady=(6, 2))
+        self.voice_status_label = ttk.Label(
+            media, text="", foreground="#444444", wraplength=260, justify="left"
+        )
+        self.voice_status_label.pack(anchor="w", padx=2)
+
+        # Generated voice assets (playback only — never placed on a timeline)
+        self.assets_frame = ttk.LabelFrame(media, text="Assets", padding=6)
+        self.assets_frame.pack(fill=tk.X, pady=(6, 0))
+        self._rebuild_assets_list()
 
         # 2. Voice Library (Phase 1)
         self._build_voice_section(sidebar)
@@ -152,7 +198,7 @@ class App(tk.Tk):
 
         note = ttk.Label(
             sidebar,
-            text="Media, Preview, Timeline and Export\nare placeholders for now.",
+            text="Video Preview, Timeline and Export\nare placeholders for now.",
             foreground="#666666",
         )
         note.pack(anchor="w", pady=(4, 0))
@@ -501,6 +547,200 @@ class App(tk.Tk):
             stop_sound()
             self._set_preview_busy(False)
             self._set_preview_status("")
+
+    # ------------------------------------- Phase 3: SRT + voice generation
+
+    def _set_voice_status(self, message: str) -> None:
+        self.voice_status_label.configure(text=message)
+
+    def _update_voice_controls(self) -> None:
+        """Sync button states with generating / playing flags."""
+        self.generate_voice_button.configure(
+            state="disabled" if self._voice_generating else "normal"
+        )
+        if getattr(self, "asset_stop_button", None) is not None:
+            self.asset_stop_button.configure(
+                state="normal" if self._voice_playing else "disabled"
+            )
+
+    def _on_upload_srt(self) -> None:
+        """Pick an .srt file and store its path in application state."""
+        file_path = filedialog.askopenfilename(
+            title="Select an SRT file",
+            filetypes=[("SubRip subtitles", "*.srt"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return  # user cancelled -> do nothing
+        self.srt_path = Path(file_path)
+        self.srt_label.configure(text=f"SRT: {self.srt_path.name}")
+        self._set_status(f"SRT selected: {self.srt_path}")
+
+    def _on_generate_voice(self) -> None:
+        """Generate ONE WAV from the complete SRT narration text."""
+        if self._voice_generating:
+            return
+        if self.srt_path is None:
+            self._set_voice_status("No SRT selected. Upload an SRT file first.")
+            self._set_status("No SRT selected. Upload an SRT file first.")
+            return
+        if self.selected_voice is None:
+            self._set_voice_status("No voice selected. Select a voice first.")
+            self._set_status("No voice selected. Select a voice first.")
+            return
+
+        try:
+            text = parse_srt_text(self.srt_path)
+        except SrtError as exc:
+            self._set_voice_status(str(exc))
+            self._set_status(str(exc))
+            return
+
+        voice = self.selected_voice
+        wav_path = new_voice_wav_path(GENERATED_DIR)
+        self._voice_generating = True
+        self._update_voice_controls()
+        self._set_voice_status("Generating voice...")
+        self._set_status("Generating voice...")
+        started_at = time.monotonic()
+        threading.Thread(
+            target=self._generate_voice_worker,
+            args=(voice.model_path, voice.json_path, text, wav_path, started_at),
+            daemon=True,
+        ).start()
+
+    def _generate_voice_worker(
+        self,
+        model_path: Path,
+        config_path: Path,
+        text: str,
+        wav_path: Path,
+        started_at: float,
+    ) -> None:
+        """Background Piper generation (never touches Tkinter directly)."""
+        error: Optional[str] = None
+        try:
+            generate_voice_wav(model_path, config_path, text, wav_path)
+        except SrtError as exc:
+            error = str(exc)
+        except Exception:
+            error = "Voice generation failed unexpectedly."
+        elapsed = time.monotonic() - started_at
+        self._run_on_ui_thread(
+            lambda: self._on_voice_generated(wav_path, error, elapsed)
+        )
+
+    def _on_voice_generated(
+        self, wav_path: Path, error: Optional[str], elapsed: float
+    ) -> None:
+        self._voice_generating = False
+        self._update_voice_controls()
+        if error is not None:
+            self._set_voice_status(error)
+            self._set_status(error)
+            return
+        if not is_valid_wav(wav_path):
+            message = "Generated WAV file is missing or invalid."
+            self._set_voice_status(message)
+            self._set_status(message)
+            return
+        # Keep previous generated assets; add the new one as well.
+        self.generated_wavs.append(wav_path)
+        self._rebuild_assets_list()
+        message = f"Voice generated successfully. ({elapsed:.1f}s)"
+        self._set_voice_status(message)
+        self._set_status(f"{message} -> {wav_path.name}")
+
+    def _rebuild_assets_list(self) -> None:
+        """Show generated WAVs as playable media assets (no timeline)."""
+        for child in self.assets_frame.winfo_children():
+            child.destroy()
+
+        ttk.Label(
+            self.assets_frame,
+            text="Audio:",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w")
+
+        if not self.generated_wavs:
+            ttk.Label(
+                self.assets_frame,
+                text="No generated audio yet.",
+                foreground="#888888",
+            ).pack(anchor="w", pady=(0, 2))
+        else:
+            for wav_path in self.generated_wavs:
+                row = ttk.Frame(self.assets_frame)
+                row.pack(fill=tk.X, pady=1)
+                row.columnconfigure(0, weight=1)
+                ttk.Label(
+                    row,
+                    text=f"\U0001F50A {wav_path.name}",
+                    wraplength=185,
+                ).grid(row=0, column=0, sticky="w")
+                ttk.Button(
+                    row,
+                    text="\u25B6 Play",
+                    width=8,
+                    command=lambda p=wav_path: self._on_play_asset(p),
+                ).grid(row=0, column=1, sticky="e")
+
+        self.asset_stop_button = ttk.Button(
+            self.assets_frame,
+            text="Stop",
+            command=self._on_stop_asset,
+            state="normal" if self._voice_playing else "disabled",
+        )
+        self.asset_stop_button.pack(fill=tk.X, pady=(4, 0))
+
+    def _on_play_asset(self, wav_path: Path) -> None:
+        """Play a generated WAV locally (blocking, on a worker thread)."""
+        if self._voice_playing:
+            return
+        if not is_valid_wav(wav_path):
+            self._set_voice_status("This WAV file is missing or invalid.")
+            return
+        self._cancel_preview_if_active()  # winsound plays one sound at a time
+        self._voice_play_token += 1
+        token = self._voice_play_token
+        self._voice_playing = True
+        self._update_voice_controls()
+        self._set_voice_status(f"Playing {wav_path.name}...")
+        threading.Thread(
+            target=self._asset_playback_worker,
+            args=(token, wav_path),
+            daemon=True,
+        ).start()
+
+    def _asset_playback_worker(self, token: int, wav_path: Path) -> None:
+        error: Optional[str] = None
+        try:
+            play_wav_blocking(wav_path)
+        except PreviewError as exc:
+            error = str(exc)
+        except Exception:
+            error = "Playback failed."
+        self._run_on_ui_thread(
+            lambda: self._on_asset_playback_done(token, error)
+        )
+
+    def _on_asset_playback_done(self, token: int, error: Optional[str]) -> None:
+        self._voice_playing = False
+        if token != self._voice_play_token:
+            return  # stopped or superseded
+        self._update_voice_controls()
+        if error is not None:
+            self._set_voice_status(error)
+        else:
+            self._set_voice_status("Playback finished.")
+
+    def _on_stop_asset(self) -> None:
+        """Stop generated-audio playback and cancel pending callbacks."""
+        self._voice_play_token += 1
+        self._voice_playing = False
+        stop_sound()
+        self._update_voice_controls()
+        self._set_voice_status("Stopped.")
+        self._set_status("Audio playback stopped.")
 
     def _build_preview(self, parent: ttk.Widget) -> None:
         # 3. Video Preview
