@@ -20,6 +20,7 @@ effects, mixing, export, project save/load.
 from __future__ import annotations
 
 import math
+import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -67,6 +68,7 @@ class Timeline:
     video_clip: Optional[VideoClip] = None
     audio_clips: List[AudioClip] = field(default_factory=list)
     playhead: float = 0.0  # seconds
+    selected_audio: Optional[int] = None  # index into audio_clips
 
     # ------------------------------------------------------------- state
 
@@ -94,6 +96,54 @@ class Timeline:
         """Remove the video clip (empty timeline, duration 0)."""
         self.video_clip = None
         self.playhead = 0.0
+
+    # ------------------------------------------------------------ audio
+
+    def add_audio_clip(self, source: Path, start: float, duration: float) -> AudioClip:
+        """Create and append a new audio clip at ``start`` (seconds).
+
+        Only a reference/path is stored; the WAV file is never touched.
+        ``start`` is clamped to >= 0. A clip may extend past the video
+        duration for now (no trimming in this phase). Returns the new clip.
+        """
+        clip = AudioClip(
+            source=Path(source),
+            start=max(0.0, float(start)),
+            duration=max(0.0, float(duration)),
+        )
+        self.audio_clips.append(clip)
+        return clip
+
+    def move_audio_clip(self, index: int, start: float) -> None:
+        """Move an existing audio clip horizontally (change only its start).
+
+        The clip's source and duration are intentionally left untouched.
+        ``start`` is clamped to >= 0.
+        """
+        if index < 0 or index >= len(self.audio_clips):
+            return
+        self.audio_clips[index].start = max(0.0, float(start))
+
+    def select_audio(self, index: Optional[int]) -> None:
+        """Select (or deselect, with None) an audio clip by index."""
+        if index is not None and (index < 0 or index >= len(self.audio_clips)):
+            self.selected_audio = None
+            return
+        self.selected_audio = index
+
+    def audio_clip_at(self, seconds: float, top: float, bottom: float) -> Optional[int]:
+        """Return the index of the audio clip whose horizontal time range
+        covers ``seconds``, or None if none matches.
+
+        ``top``/``bottom`` are passed by the caller only to document the
+        intended hit-test contract; the y-coordinate check is performed by
+        the UI layer so the model stays pixel-free.
+        """
+        for index, clip in enumerate(self.audio_clips):
+            clip_end = clip.start + clip.duration
+            if clip.start <= seconds <= clip_end:
+                return index
+        return None
 
     def set_playhead(self, seconds: float) -> float:
         """Move the playhead, clamped to [0, duration]. Returns it."""
@@ -179,3 +229,18 @@ def format_ruler_label(seconds: float) -> str:
     if secs == 0:
         return f"{minutes}m"
     return f"{minutes}m{secs:02d}s"
+
+
+def probe_wav_duration(wav_path: Path) -> float:
+    """Read a WAV file's duration in seconds (frames / frame rate).
+
+    Phase 6 needs the real duration so an AudioClip placed on the timeline
+    is the correct length. Pure stdlib ``wave``: no subprocess, no FFmpeg.
+    Raises OSError (or wave.Error) when the file is missing or not a WAV.
+    """
+    with wave.open(str(Path(wav_path)), "rb") as wav_file:
+        frame_rate = wav_file.getframerate()
+        frames = wav_file.getnframes()
+    if frame_rate <= 0:
+        return 0.0
+    return float(frames) / float(frame_rate)

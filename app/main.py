@@ -20,7 +20,12 @@ Export.
 - Phase 5: a real (non-destructive, metadata-only) Timeline with a
   time ruler, a VIDEO track showing the active video clip, an empty
   AUDIO track and a playhead that follows the VideoPlayer. Clicking
-  the timeline seeks the video. No editing interactions yet.
+  the timeline seeks the video.
+- Phase 6: generated WAV assets can be dragged from the Media/Assets
+  panel onto the AUDIO track to create AudioClips (metadata-only
+  references, WAV duration read from the file). AudioClips can then be
+  moved horizontally by dragging, and selected by clicking. No trimming,
+  splitting, snapping, mixing or playback of timeline audio yet.
 
 Export remains a placeholder.
 
@@ -46,7 +51,7 @@ from app.srt_voice import (
     new_voice_wav_path,
     parse_srt_text,
 )
-from app.timeline import Timeline, format_ruler_label
+from app.timeline import Timeline, format_ruler_label, probe_wav_duration
 from app.video_preview import (
     SUPPORTED_VIDEO_EXTENSIONS,
     VideoError,
@@ -70,7 +75,7 @@ from app.voice_preview import (
     stop_sound,
 )
 
-APP_TITLE = "Local Video Editor — Phase 5 (Timeline Foundation)"
+APP_TITLE = "Local Video Editor — Phase 6 (Audio Drag to Audio Timeline)"
 COMING_SOON = "Coming in next phases"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -95,6 +100,13 @@ AUDIO_TRACK_FILL = "#f0f0f0"
 AUDIO_TRACK_EDGE = "#d5d5d5"
 AUDIO_PLACEHOLDER_TEXT = "#a8a8a8"
 PLAYHEAD_COLOR = "#e03131"
+
+# Phase 6 audio clip colors (distinct from video clip).
+AUDIO_CLIP_FILL = "#6fbe6f"
+AUDIO_CLIP_EDGE = "#3d8f3d"
+AUDIO_CLIP_TEXT = "#123012"
+AUDIO_CLIP_SELECTED_FILL = "#a6e3a6"
+AUDIO_CLIP_SELECTED_EDGE = "#1f7a1f"
 
 
 class App(tk.Tk):
@@ -138,6 +150,12 @@ class App(tk.Tk):
         # The VideoPlayer is the single source of truth for playback
         # time; the timeline playhead only mirrors it.
         self.timeline = Timeline()
+
+        # Phase 6 drag/drop state. ``self._drag`` is None while idle, or a
+        # small dict describing an in-progress drag:
+        #   {"kind": "media", "path": Path}  (asset dragged from Media panel)
+        #   {"kind": "clip", "index": int, "offset": float}  (clip being moved)
+        self._drag = None
 
         self._build_layout()
 
@@ -184,6 +202,14 @@ class App(tk.Tk):
         self._build_preview(root)
         self._build_timeline(root)
         self._build_status_bar()
+
+        # App-wide drag tracking. These receive every button-motion /
+        # button-release regardless of which widget is under the pointer,
+        # which is what allows dragging an asset from the Media panel onto
+        # the timeline canvas. Each handler no-ops unless ``self._drag``
+        # is active.
+        self.bind_all("<B1-Motion>", self._on_global_drag_motion)
+        self.bind_all("<ButtonRelease-1>", self._on_global_drag_release)
 
     def _section(self, parent: ttk.Widget, title: str) -> ttk.LabelFrame:
         frame = ttk.LabelFrame(parent, text=title, padding=8)
@@ -748,11 +774,21 @@ class App(tk.Tk):
                 row = ttk.Frame(self.assets_frame)
                 row.pack(fill=tk.X, pady=1)
                 row.columnconfigure(0, weight=1)
-                ttk.Label(
+                asset_label = ttk.Label(
                     row,
                     text=f"\U0001F50A {wav_path.name}",
-                    wraplength=185,
-                ).grid(row=0, column=0, sticky="w")
+                    wraplength=230,
+                    cursor="fleur",
+                )
+                asset_label.grid(row=0, column=0, sticky="w")
+                asset_label.bind(
+                    "<ButtonPress-1>",
+                    lambda _e, p=wav_path: self._on_asset_drag_start(p),
+                )
+                row.bind(
+                    "<ButtonPress-1>",
+                    lambda _e, p=wav_path: self._on_asset_drag_start(p),
+                )
                 ttk.Button(
                     row,
                     text="\u25B6 Play",
@@ -1139,7 +1175,7 @@ class App(tk.Tk):
         )
         self.timeline_canvas.grid(row=0, column=0, sticky="nsew")
         self.timeline_canvas.bind("<Configure>", self._on_timeline_resize)
-        # The ONLY mouse interaction in this phase: click to seek.
+        # Click / press handling (seek, or audio-clip move).
         self.timeline_canvas.bind("<Button-1>", self._on_timeline_click)
 
         self._redraw_timeline()
@@ -1269,18 +1305,47 @@ class App(tk.Tk):
                     tags="video_track",
                 )
 
-        # --- AUDIO track (empty in this phase) ---
+        # --- AUDIO track ---
         canvas.create_rectangle(
             left, g["audio_top"], left + width, g["audio_bottom"],
             fill=AUDIO_TRACK_FILL, outline=AUDIO_TRACK_EDGE,
             tags="audio_track",
         )
-        canvas.create_text(
-            left + width / 2, audio_mid,
-            text="Drag audio here (coming in a future phase)",
-            fill=AUDIO_PLACEHOLDER_TEXT, font=("Segoe UI", 9),
-            tags="audio_track",
-        )
+        if not self.timeline.audio_clips:
+            canvas.create_text(
+                left + width / 2, audio_mid,
+                text="Drag audio from the Assets panel onto this track",
+                fill=AUDIO_PLACEHOLDER_TEXT, font=("Segoe UI", 9),
+                tags="audio_track",
+            )
+        for index, aclip in enumerate(self.timeline.audio_clips):
+            ax0 = self.timeline.time_to_x(aclip.start, left, width)
+            ax1 = self.timeline.time_to_x(aclip.start + aclip.duration, left, width)
+            if ax1 - ax0 < 6:
+                ax1 = ax0 + 6  # keep over-running clips visible at the edge
+            if index == self.timeline.selected_audio:
+                fill = AUDIO_CLIP_SELECTED_FILL
+                edge = AUDIO_CLIP_SELECTED_EDGE
+                outline_w = 2
+            else:
+                fill = AUDIO_CLIP_FILL
+                edge = AUDIO_CLIP_EDGE
+                outline_w = 1
+            canvas.create_rectangle(
+                ax0, g["audio_top"], ax1, g["audio_bottom"],
+                fill=fill, outline=edge, width=outline_w,
+                tags=("audio_track", "audio_clip"),
+            )
+            max_chars = int((ax1 - ax0 - 12) / 6)
+            if max_chars >= 5:
+                name = aclip.source.name
+                if len(name) > max_chars:
+                    name = name[: max_chars - 1] + "\u2026"
+                canvas.create_text(
+                    (ax0 + ax1) / 2, audio_mid, text=name,
+                    fill=AUDIO_CLIP_TEXT, font=("Segoe UI", 8),
+                    tags=("audio_track", "audio_clip"),
+                )
 
         self._update_playhead()
 
@@ -1313,13 +1378,35 @@ class App(tk.Tk):
         self._redraw_timeline()
 
     def _on_timeline_click(self, event: tk.Event) -> None:
-        """Click ruler/tracks -> move playhead and seek the video.
+        """Press on timeline: start an audio-clip drag or seek the video.
 
-        This is the ONLY mouse interaction implemented in Phase 5.
+        - Press over an AudioClip on the AUDIO track -> begin a move drag.
+        - Press anywhere else (ruler, VIDEO track, empty audio) -> seek.
         """
+        g = self._timeline_geometry()
+        # Audio-clip hit test (must be within the AUDIO track band and the
+        # timeline's horizontal extent).
+        if (
+            g["audio_top"] <= event.y <= g["audio_bottom"]
+            and g["left"] <= event.x <= g["left"] + g["width"]
+        ):
+            seconds = self.timeline.x_to_time(event.x, g["left"], g["width"])
+            index = self.timeline.audio_clip_at(
+                seconds, g["audio_top"], g["audio_bottom"]
+            )
+            if index is not None:
+                self.timeline.select_audio(index)
+                clip = self.timeline.audio_clips[index]
+                self._drag = {
+                    "kind": "clip",
+                    "index": index,
+                    "offset": seconds - clip.start,
+                }
+                self._redraw_timeline()
+                return
+
         if self.timeline.duration <= 0.0:
             return  # empty timeline: nothing to seek
-        g = self._timeline_geometry()
         target = self.timeline.x_to_time(event.x, g["left"], g["width"])
         target = self.timeline.set_playhead(target)
         self._update_playhead()
@@ -1330,6 +1417,101 @@ class App(tk.Tk):
             self.video_player.seek(target)
             self.after(150, self._clear_seek_pending)
         self._set_status(f"Timeline seeked to {format_timecode(target)}.")
+
+    def _on_asset_drag_start(self, wav_path: Path) -> None:
+        """Begin an audio-asset drag from the Media panel (Phase 6).
+
+        The actual drop is resolved by the app-wide motion/release handlers
+        below, so a click that never leaves the panel can simply cancel.
+        """
+        self._drag = {"kind": "media", "path": Path(wav_path)}
+        self._set_status(f"Drag {wav_path.name} onto the AUDIO track\u2026")
+
+    def _pointer_on_canvas(self, event: tk.Event) -> tuple:
+        """Return (xc, yc) canvas coordinates for a global event, or None.
+
+        Uses root-relative coordinates so it works for events delivered to
+        any widget via ``bind_all``.
+        """
+        canvas = self.timeline_canvas
+        xc = event.x_root - canvas.winfo_rootx()
+        yc = event.y_root - canvas.winfo_rooty()
+        return xc, yc
+
+    def _timeline_x_in_bounds(self, g: dict, xc: float) -> float:
+        """Clamp an x canvas coordinate to the timeline drawing extent."""
+        return min(max(xc, g["left"]), g["left"] + g["width"])
+
+    def _on_global_drag_motion(self, event: tk.Event) -> None:
+        """During an audio drag, show a drop hint / move the clip live."""
+        if self._drag is None:
+            return
+        g = self._timeline_geometry()
+        xc, yc = self._pointer_on_canvas(event)
+        over_audio = (
+            g["left"] <= xc <= g["left"] + g["width"]
+            and g["audio_top"] <= yc <= g["audio_bottom"]
+        )
+
+        if self._drag["kind"] == "clip":
+            seconds = self.timeline.x_to_time(xc, g["left"], g["width"])
+            new_start = seconds - self._drag["offset"]
+            self.timeline.move_audio_clip(self._drag["index"], new_start)
+            self._redraw_timeline()
+            self._set_status(
+                f"Moving audio clip to {format_timecode(max(0.0, new_start))}."
+            )
+            return
+
+        # kind == "media": draw/update a small drop-hint on the audio track.
+        canvas = self.timeline_canvas
+        canvas.delete("drop_hint")
+        if over_audio:
+            x = self._timeline_x_in_bounds(g, xc)
+            canvas.create_line(
+                x, g["audio_top"] + 2, x, g["audio_bottom"] - 2,
+                fill=AUDIO_CLIP_SELECTED_EDGE, width=2, dash=(3, 2),
+                tags="drop_hint",
+            )
+
+    def _on_global_drag_release(self, event: tk.Event) -> None:
+        """Resolve an in-progress audio drag (drop or move)."""
+        if self._drag is None:
+            return
+        drag = self._drag
+        self._drag = None
+        self.timeline_canvas.delete("drop_hint")
+
+        if drag["kind"] == "media":
+            g = self._timeline_geometry()
+            xc, yc = self._pointer_on_canvas(event)
+            over_audio = (
+                g["left"] <= xc <= g["left"] + g["width"]
+                and g["audio_top"] <= yc <= g["audio_bottom"]
+            )
+            if not over_audio:
+                self._set_status("Audio drop cancelled (not over the AUDIO track).")
+                return
+            try:
+                duration = probe_wav_duration(drag["path"])
+            except OSError as exc:
+                self._set_status(f"Could not read WAV: {exc}")
+                return
+            start = self.timeline.x_to_time(xc, g["left"], g["width"])
+            self.timeline.add_audio_clip(drag["path"], start, duration)
+            self._redraw_timeline()
+            self._set_status(
+                f"Added audio clip {drag['path'].name} "
+                f"({format_timecode(duration)}) at {format_timecode(start)}."
+            )
+        else:  # kind == "clip"
+            self._redraw_timeline()
+            idx = drag["index"]
+            if 0 <= idx < len(self.timeline.audio_clips):
+                start = self.timeline.audio_clips[idx].start
+                self._set_status(
+                    f"Audio clip moved to {format_timecode(start)}."
+                )
 
     def _build_status_bar(self) -> None:
         self.status_var = tk.StringVar()
