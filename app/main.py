@@ -26,6 +26,13 @@ Export.
   references, WAV duration read from the file). AudioClips can then be
   moved horizontally by dragging, and selected by clicking. No trimming,
   splitting, snapping, mixing or playback of timeline audio yet.
+- Phase 7: timeline editing workflow. Audio clips are kept within the
+  timeline bounds (drag/drop clamped by the model), WAVs longer than
+  the timeline are rejected on drop with a status message, clicking
+  anywhere that is not a clip deselects the selected clip, overlapping
+  clips resolve to the topmost one, and audio clips survive video
+  changes (re-clamped into the new duration). No trimming, snapping,
+  undo/redo or mixing yet.
 
 Export remains a placeholder.
 
@@ -75,7 +82,7 @@ from app.voice_preview import (
     stop_sound,
 )
 
-APP_TITLE = "Local Video Editor — Phase 6 (Audio Drag to Audio Timeline)"
+APP_TITLE = "Local Video Editor — Phase 7 (Timeline Editing Workflow)"
 COMING_SOON = "Coming in next phases"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -1380,8 +1387,10 @@ class App(tk.Tk):
     def _on_timeline_click(self, event: tk.Event) -> None:
         """Press on timeline: start an audio-clip drag or seek the video.
 
-        - Press over an AudioClip on the AUDIO track -> begin a move drag.
-        - Press anywhere else (ruler, VIDEO track, empty audio) -> seek.
+        - Press over an AudioClip on the AUDIO track -> select it and
+          begin a move drag.
+        - Press anywhere else (ruler, VIDEO track, empty AUDIO track) ->
+          deselect any selected audio clip (Phase 7) and seek.
         """
         g = self._timeline_geometry()
         # Audio-clip hit test (must be within the AUDIO track band and the
@@ -1403,7 +1412,18 @@ class App(tk.Tk):
                     "offset": seconds - clip.start,
                 }
                 self._redraw_timeline()
+                self._set_status(
+                    f"Selected audio clip: {clip.source.name} "
+                    f"({format_timecode(clip.duration)}) at "
+                    f"{format_timecode(clip.start)}."
+                )
                 return
+
+        # Phase 7: any press that is not on an audio clip deselects the
+        # currently selected clip (empty AUDIO track, ruler, VIDEO track).
+        if self.timeline.selected_audio is not None:
+            self.timeline.select_audio(None)
+            self._redraw_timeline()
 
         if self.timeline.duration <= 0.0:
             return  # empty timeline: nothing to seek
@@ -1458,8 +1478,9 @@ class App(tk.Tk):
             new_start = seconds - self._drag["offset"]
             self.timeline.move_audio_clip(self._drag["index"], new_start)
             self._redraw_timeline()
+            actual = self.timeline.audio_clips[self._drag["index"]].start
             self._set_status(
-                f"Moving audio clip to {format_timecode(max(0.0, new_start))}."
+                f"Moving audio clip to {format_timecode(actual)}."
             )
             return
 
@@ -1497,13 +1518,31 @@ class App(tk.Tk):
             except OSError as exc:
                 self._set_status(f"Could not read WAV: {exc}")
                 return
+            # Phase 7: reject WAVs longer than the timeline (no partial
+            # clips are ever created).
+            if self.timeline.duration > 0 and duration > self.timeline.duration:
+                self._set_status(
+                    f"Cannot add {drag['path'].name}: the WAV "
+                    f"({format_timecode(duration)}) is longer than the "
+                    f"timeline ({format_timecode(self.timeline.duration)})."
+                )
+                return
             start = self.timeline.x_to_time(xc, g["left"], g["width"])
-            self.timeline.add_audio_clip(drag["path"], start, duration)
+            clip = self.timeline.add_audio_clip(drag["path"], start, duration)
             self._redraw_timeline()
-            self._set_status(
-                f"Added audio clip {drag['path'].name} "
-                f"({format_timecode(duration)}) at {format_timecode(start)}."
-            )
+            if clip.start != start:
+                self._set_status(
+                    f"Added audio clip {drag['path'].name} "
+                    f"({format_timecode(duration)}) at "
+                    f"{format_timecode(clip.start)} "
+                    f"(clamped to fit the timeline)."
+                )
+            else:
+                self._set_status(
+                    f"Added audio clip {drag['path'].name} "
+                    f"({format_timecode(duration)}) at "
+                    f"{format_timecode(start)}."
+                )
         else:  # kind == "clip"
             self._redraw_timeline()
             idx = drag["index"]

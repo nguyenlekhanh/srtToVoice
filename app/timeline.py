@@ -1,20 +1,23 @@
-"""Timeline data model (Phase 5 — timeline foundation).
+"""Timeline data model (Phases 5–7).
 
 This module is deliberately UI-free: it contains only the timeline
 state and pure time<->pixel scaling math. No Tkinter, no decoding, no
 file access. The source video file is referenced by path only and is
 NEVER copied, modified or re-encoded by the timeline.
 
-Scope of this phase:
+Scope (Phases 5–7):
 - data model: VideoClip, AudioClip, Timeline
 - timeline duration (== active video duration, 0 when no video)
+- audio clip placement with bounds clamping (Phase 7): a clip's start
+  always stays within [0, duration] so clips never over-run the
+  timeline; clips longer than the timeline pin to start 0
 - playhead position (seconds, clamped to the timeline)
 - time ruler tick selection
 - time <-> pixel scaling helpers
+- WAV duration probing via stdlib ``wave`` (Phase 6)
 
-Explicitly NOT implemented here (future phases): drag and drop, audio
-placement, trimming, splitting, resizing, snapping, transitions,
-effects, mixing, export, project save/load.
+Explicitly NOT implemented here (future phases): trimming, splitting,
+snapping, transitions, effects, mixing, export, project save/load.
 """
 
 from __future__ import annotations
@@ -83,7 +86,9 @@ class Timeline:
         """Attach the active source video as the timeline's video clip.
 
         Only metadata is stored; the file itself is never touched.
-        The playhead resets to the start of the timeline.
+        The playhead resets to the start of the timeline. Existing
+        audio clips are kept but re-clamped into the new bounds
+        (Phase 7: a shorter video must not leave clips over-running).
         """
         self.video_clip = VideoClip(
             source=Path(source),
@@ -91,24 +96,49 @@ class Timeline:
             duration=max(0.0, float(duration)),
         )
         self.playhead = 0.0
+        self.clamp_audio_clips()
 
     def clear_video(self) -> None:
-        """Remove the video clip (empty timeline, duration 0)."""
+        """Remove the video clip (empty timeline, duration 0).
+
+        Audio clips are kept (Phase 7 policy) but pinned to start 0
+        while the timeline has no duration.
+        """
         self.video_clip = None
         self.playhead = 0.0
+        self.clamp_audio_clips()
 
     # ------------------------------------------------------------ audio
+
+    def _clamp_start(self, start: float, clip_duration: float) -> float:
+        """Clamp a clip start into the timeline bounds (Phase 7).
+
+        - ``start`` is always >= 0.
+        - With a positive timeline duration the clip's start is also
+          capped so the clip never over-runs the right edge:
+          ``start <= duration - clip_duration``.
+        - A clip longer than the timeline pins to start 0 (it may
+          visually extend; trimming is a future phase).
+        - With no timeline duration (no video) the start pins to 0.
+        """
+        start = max(0.0, float(start))
+        duration = self.duration
+        if duration <= 0.0:
+            return 0.0
+        latest = duration - max(0.0, float(clip_duration))
+        return min(start, max(0.0, latest))
 
     def add_audio_clip(self, source: Path, start: float, duration: float) -> AudioClip:
         """Create and append a new audio clip at ``start`` (seconds).
 
         Only a reference/path is stored; the WAV file is never touched.
-        ``start`` is clamped to >= 0. A clip may extend past the video
-        duration for now (no trimming in this phase). Returns the new clip.
+        ``start`` is clamped into the timeline bounds (Phase 7): never
+        negative, and never so far right that the clip over-runs the
+        timeline. Returns the new clip.
         """
         clip = AudioClip(
             source=Path(source),
-            start=max(0.0, float(start)),
+            start=self._clamp_start(start, duration),
             duration=max(0.0, float(duration)),
         )
         self.audio_clips.append(clip)
@@ -118,11 +148,23 @@ class Timeline:
         """Move an existing audio clip horizontally (change only its start).
 
         The clip's source and duration are intentionally left untouched.
-        ``start`` is clamped to >= 0.
+        ``start`` is clamped into the timeline bounds (Phase 7), so a
+        drag past the right edge stops at ``duration - clip.duration``.
         """
         if index < 0 or index >= len(self.audio_clips):
             return
-        self.audio_clips[index].start = max(0.0, float(start))
+        clip = self.audio_clips[index]
+        clip.start = self._clamp_start(start, clip.duration)
+
+    def clamp_audio_clips(self) -> None:
+        """Re-clamp every audio clip into the current timeline bounds.
+
+        Called when the video duration changes (new video / cleared
+        video) so existing clips never over-run the timeline. Clips are
+        kept, never deleted (Phase 7 policy).
+        """
+        for clip in self.audio_clips:
+            clip.start = self._clamp_start(clip.start, clip.duration)
 
     def select_audio(self, index: Optional[int]) -> None:
         """Select (or deselect, with None) an audio clip by index."""
@@ -135,11 +177,15 @@ class Timeline:
         """Return the index of the audio clip whose horizontal time range
         covers ``seconds``, or None if none matches.
 
+        Overlapping clips resolve to the topmost one: the last-added
+        clip is drawn on top, so it is checked first (Phase 7).
+
         ``top``/``bottom`` are passed by the caller only to document the
         intended hit-test contract; the y-coordinate check is performed by
         the UI layer so the model stays pixel-free.
         """
-        for index, clip in enumerate(self.audio_clips):
+        for index in range(len(self.audio_clips) - 1, -1, -1):
+            clip = self.audio_clips[index]
             clip_end = clip.start + clip.duration
             if clip.start <= seconds <= clip_end:
                 return index
