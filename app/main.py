@@ -17,8 +17,12 @@ Export.
   the Video Preview area with play/pause/stop, seek, time display,
   volume and mute. The original file is only read — never copied,
   modified or re-encoded. No timeline placement, trimming or export.
+- Phase 5: a real (non-destructive, metadata-only) Timeline with a
+  time ruler, a VIDEO track showing the active video clip, an empty
+  AUDIO track and a playhead that follows the VideoPlayer. Clicking
+  the timeline seeks the video. No editing interactions yet.
 
-Timeline and Export remain placeholders.
+Export remains a placeholder.
 
 Run with the project's .venv:
     .venv\\Scripts\\python.exe -m app.main
@@ -42,6 +46,7 @@ from app.srt_voice import (
     new_voice_wav_path,
     parse_srt_text,
 )
+from app.timeline import Timeline, format_ruler_label
 from app.video_preview import (
     SUPPORTED_VIDEO_EXTENSIONS,
     VideoError,
@@ -65,7 +70,7 @@ from app.voice_preview import (
     stop_sound,
 )
 
-APP_TITLE = "Local Video Editor — Phase 4 (Video Upload + Preview)"
+APP_TITLE = "Local Video Editor — Phase 5 (Timeline Foundation)"
 COMING_SOON = "Coming in next phases"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -76,6 +81,20 @@ GENERATED_DIR = PROJECT_ROOT / "generated"
 BG = "#f2f2f2"
 PANEL_BG = "#ffffff"
 PREVIEW_BG = "#1e1e1e"
+
+# Phase 5 timeline colors.
+TIMELINE_BG = "#fafafa"
+RULER_BG = "#ececec"
+RULER_LINE = "#b5b5b5"
+RULER_TEXT = "#555555"
+TRACK_LABEL = "#666666"
+VIDEO_CLIP_FILL = "#4a90d9"
+VIDEO_CLIP_EDGE = "#2f6cb0"
+VIDEO_CLIP_TEXT = "#ffffff"
+AUDIO_TRACK_FILL = "#f0f0f0"
+AUDIO_TRACK_EDGE = "#d5d5d5"
+AUDIO_PLACEHOLDER_TEXT = "#a8a8a8"
+PLAYHEAD_COLOR = "#e03131"
 
 
 class App(tk.Tk):
@@ -114,6 +133,11 @@ class App(tk.Tk):
         self._video_photo: Optional[ImageTk.PhotoImage] = None  # keep ref
         self._video_seek_pending = False  # suppress seek-slider feedback
         self._video_tick_token = 0  # invalidates stale tick callbacks
+
+        # Phase 5 state: non-destructive timeline model (metadata only).
+        # The VideoPlayer is the single source of truth for playback
+        # time; the timeline playhead only mirrors it.
+        self.timeline = Timeline()
 
         self._build_layout()
 
@@ -228,7 +252,7 @@ class App(tk.Tk):
 
         note = ttk.Label(
             sidebar,
-            text="Timeline and Export are placeholders for now.",
+            text="Export is a placeholder for now.",
             foreground="#666666",
         )
         note.pack(anchor="w", pady=(4, 0))
@@ -822,6 +846,8 @@ class App(tk.Tk):
         except VideoError as exc:
             self._set_status(str(exc))
             self.video_label.configure(text="Video: (none)")
+            self.timeline.clear_video()
+            self._redraw_timeline()
             self._rebuild_assets_list()
             return
 
@@ -841,6 +867,12 @@ class App(tk.Tk):
 
         self.video_path = path
         self._video_tick_token += 1
+
+        # Phase 5: sync the timeline with the uploaded video. The
+        # timeline only stores metadata (path + duration); the source
+        # file itself is never copied or modified.
+        self.timeline.set_video(path, info.duration)
+        self._redraw_timeline()
 
         # Update UI state.
         self.video_label.configure(text=f"Video: {path.name}")
@@ -919,6 +951,10 @@ class App(tk.Tk):
         self._update_time_label(position, duration)
         if not self._video_seek_pending and duration > 0:
             self.seek_var.set(position)
+        # Phase 5: VideoPlayer is the single source of truth for the
+        # current time; the timeline playhead only mirrors it.
+        self.timeline.set_playhead(position)
+        self._update_playhead()
 
     def _update_time_label(self, position: float, duration: float) -> None:
         self.time_label.configure(
@@ -933,6 +969,8 @@ class App(tk.Tk):
             return
         duration = self.video_player.duration
         self._update_time_label(duration, duration)
+        self.timeline.set_playhead(duration)
+        self._update_playhead()
         self.play_pause_button.configure(text="\u25B6 Play")
         self._set_status("Video playback finished.")
 
@@ -962,6 +1000,8 @@ class App(tk.Tk):
         self.play_pause_button.configure(text="\u25B6 Play")
         self._update_time_label(0.0, self.video_player.duration)
         self.seek_var.set(0.0)
+        self.timeline.set_playhead(0.0)
+        self._update_playhead()
         self._set_status("Video stopped.")
 
     def _on_seek_drag(self, _value: str) -> None:
@@ -971,6 +1011,10 @@ class App(tk.Tk):
         target = float(self.seek_var.get())
         self.video_player.seek(target)
         self._update_time_label(target, self.video_player.duration)
+        # Phase 5: seeking with the Phase 4 control also moves the
+        # timeline playhead.
+        self.timeline.set_playhead(target)
+        self._update_playhead()
         # Allow tick updates to resume shortly after the seek settles.
         self.after(150, self._clear_seek_pending)
 
@@ -1081,29 +1125,211 @@ class App(tk.Tk):
         self.volume_slider.grid(row=0, column=5)
 
     def _build_timeline(self, parent: ttk.Widget) -> None:
-        # 4. Timeline
+        # 4. Timeline (Phase 5: ruler + VIDEO/AUDIO tracks + playhead)
         timeline_frame = ttk.LabelFrame(parent, text="Timeline", padding=4)
         timeline_frame.grid(row=1, column=1, sticky="nsew", pady=(8, 0))
+        timeline_frame.rowconfigure(0, weight=1)
+        timeline_frame.columnconfigure(0, weight=1)
 
-        canvas = tk.Canvas(
+        self.timeline_canvas = tk.Canvas(
             timeline_frame,
-            bg=PANEL_BG,
+            bg=TIMELINE_BG,
             highlightthickness=1,
             highlightbackground="#cccccc",
         )
-        canvas.pack(fill=tk.BOTH, expand=True)
-        canvas.bind(
-            "<Configure>",
-            lambda e: canvas.coords("text", e.width / 2, e.height / 2),
+        self.timeline_canvas.grid(row=0, column=0, sticky="nsew")
+        self.timeline_canvas.bind("<Configure>", self._on_timeline_resize)
+        # The ONLY mouse interaction in this phase: click to seek.
+        self.timeline_canvas.bind("<Button-1>", self._on_timeline_click)
+
+        self._redraw_timeline()
+
+    # -------------------------------------------- Phase 5: timeline UI
+
+    # Layout constants for the timeline canvas (pixels).
+    _TL_LABEL_W = 56    # left column with the track names
+    _TL_RULER_H = 22    # height of the time ruler strip
+    _TL_VIDEO_H = 34    # height of the VIDEO track row
+    _TL_AUDIO_H = 30    # height of the AUDIO track row
+    _TL_GAP = 4         # vertical gap between rows
+    _TL_PAD_RIGHT = 8   # right padding of the time area
+
+    def _timeline_geometry(self) -> dict:
+        """Compute the timeline layout in canvas pixels.
+
+        Returns the time-area origin/width plus the vertical bounds of
+        the ruler and the two tracks. Tiny windows are clamped to sane
+        minimums so drawing never breaks while resizing.
+        """
+        canvas = self.timeline_canvas
+        cw = max(canvas.winfo_width(), 200)
+        ch = max(canvas.winfo_height(), 120)
+
+        left = self._TL_LABEL_W
+        width = max(cw - left - self._TL_PAD_RIGHT, 1)
+
+        ruler_top = 0
+        ruler_bottom = self._TL_RULER_H
+        video_top = ruler_bottom + self._TL_GAP
+        video_bottom = video_top + self._TL_VIDEO_H
+        audio_top = video_bottom + self._TL_GAP
+        audio_bottom = audio_top + self._TL_AUDIO_H
+
+        return {
+            "left": left,
+            "width": width,
+            "ruler_top": ruler_top,
+            "ruler_bottom": ruler_bottom,
+            "video_top": video_top,
+            "video_bottom": video_bottom,
+            "audio_top": audio_top,
+            "audio_bottom": audio_bottom,
+            "canvas_w": cw,
+            "canvas_h": ch,
+        }
+
+    def _redraw_timeline(self) -> None:
+        """Full redraw of ruler, tracks and playhead.
+
+        Lightweight: only rectangles/lines/text from timeline state.
+        No video decoding happens here.
+        """
+        canvas = self.timeline_canvas
+        canvas.delete("all")
+        g = self._timeline_geometry()
+        left, width = g["left"], g["width"]
+
+        # --- Time ruler ---
+        canvas.create_rectangle(
+            0, g["ruler_top"], g["canvas_w"], g["ruler_bottom"],
+            fill=RULER_BG, outline="", tags="ruler",
+        )
+        canvas.create_line(
+            left, g["ruler_bottom"], left + width, g["ruler_bottom"],
+            fill=RULER_LINE, tags="ruler",
+        )
+        for tick in self.timeline.ruler_tick_times():
+            x = self.timeline.time_to_x(tick, left, width)
+            canvas.create_line(
+                x, g["ruler_top"] + 8, x, g["ruler_bottom"],
+                fill=RULER_LINE, tags="ruler",
+            )
+            canvas.create_text(
+                x + 3, g["ruler_top"] + 2,
+                text=format_ruler_label(tick),
+                anchor="nw", fill=RULER_TEXT,
+                font=("Segoe UI", 8), tags="ruler",
+            )
+
+        # --- Track labels ---
+        video_mid = (g["video_top"] + g["video_bottom"]) / 2
+        audio_mid = (g["audio_top"] + g["audio_bottom"]) / 2
+        canvas.create_text(
+            6, video_mid, text="VIDEO", anchor="w",
+            fill=TRACK_LABEL, font=("Segoe UI", 8, "bold"),
         )
         canvas.create_text(
-            0,
-            0,
-            text="Timeline — coming in next phases",
-            fill="#8a8a8a",
-            font=("Segoe UI", 11),
-            tags="text",
+            6, audio_mid, text="AUDIO", anchor="w",
+            fill=TRACK_LABEL, font=("Segoe UI", 8, "bold"),
         )
+
+        # --- VIDEO track ---
+        clip = self.timeline.video_clip
+        if clip is None:
+            canvas.create_rectangle(
+                left, g["video_top"], left + width, g["video_bottom"],
+                fill=AUDIO_TRACK_FILL, outline=AUDIO_TRACK_EDGE,
+                dash=(3, 3), tags="video_track",
+            )
+            canvas.create_text(
+                left + width / 2, video_mid,
+                text="Upload a video to see it on the timeline",
+                fill=AUDIO_PLACEHOLDER_TEXT, font=("Segoe UI", 9),
+                tags="video_track",
+            )
+        else:
+            x0 = self.timeline.time_to_x(clip.start, left, width)
+            x1 = self.timeline.time_to_x(
+                clip.start + clip.duration, left, width
+            )
+            canvas.create_rectangle(
+                x0, g["video_top"], x1, g["video_bottom"],
+                fill=VIDEO_CLIP_FILL, outline=VIDEO_CLIP_EDGE,
+                tags="video_track",
+            )
+            # Show the filename when the block is wide enough.
+            max_chars = int((x1 - x0 - 12) / 6)
+            if max_chars >= 5:
+                name = clip.source.name
+                if len(name) > max_chars:
+                    name = name[: max_chars - 1] + "\u2026"
+                canvas.create_text(
+                    (x0 + x1) / 2, video_mid, text=name,
+                    fill=VIDEO_CLIP_TEXT, font=("Segoe UI", 8),
+                    tags="video_track",
+                )
+
+        # --- AUDIO track (empty in this phase) ---
+        canvas.create_rectangle(
+            left, g["audio_top"], left + width, g["audio_bottom"],
+            fill=AUDIO_TRACK_FILL, outline=AUDIO_TRACK_EDGE,
+            tags="audio_track",
+        )
+        canvas.create_text(
+            left + width / 2, audio_mid,
+            text="Drag audio here (coming in a future phase)",
+            fill=AUDIO_PLACEHOLDER_TEXT, font=("Segoe UI", 9),
+            tags="audio_track",
+        )
+
+        self._update_playhead()
+
+    def _update_playhead(self) -> None:
+        """Move the playhead to ``timeline.playhead`` (cheap update)."""
+        canvas = self.timeline_canvas
+        g = self._timeline_geometry()
+        x = self.timeline.time_to_x(
+            self.timeline.playhead, g["left"], g["width"]
+        )
+        top = g["ruler_top"]
+        bottom = g["audio_bottom"]
+        if canvas.find_withtag("playhead_line"):
+            canvas.coords("playhead_line", x, top, x, bottom)
+            canvas.coords(
+                "playhead_cap", x - 5, top, x + 5, top, x, top + 7
+            )
+        else:
+            canvas.create_line(
+                x, top, x, bottom, fill=PLAYHEAD_COLOR, width=2,
+                tags="playhead_line",
+            )
+            canvas.create_polygon(
+                x - 5, top, x + 5, top, x, top + 7,
+                fill=PLAYHEAD_COLOR, outline="", tags="playhead_cap",
+            )
+
+    def _on_timeline_resize(self, _event: tk.Event) -> None:
+        """Window resizing keeps the timeline usable (full redraw)."""
+        self._redraw_timeline()
+
+    def _on_timeline_click(self, event: tk.Event) -> None:
+        """Click ruler/tracks -> move playhead and seek the video.
+
+        This is the ONLY mouse interaction implemented in Phase 5.
+        """
+        if self.timeline.duration <= 0.0:
+            return  # empty timeline: nothing to seek
+        g = self._timeline_geometry()
+        target = self.timeline.x_to_time(event.x, g["left"], g["width"])
+        target = self.timeline.set_playhead(target)
+        self._update_playhead()
+        self._update_time_label(target, self.timeline.duration)
+        if self.video_player is not None:
+            self._video_seek_pending = True
+            self.seek_var.set(target)
+            self.video_player.seek(target)
+            self.after(150, self._clear_seek_pending)
+        self._set_status(f"Timeline seeked to {format_timecode(target)}.")
 
     def _build_status_bar(self) -> None:
         self.status_var = tk.StringVar()
