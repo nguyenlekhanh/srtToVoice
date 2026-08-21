@@ -1,23 +1,27 @@
-"""Timeline data model (Phases 5–7).
+"""Timeline data model (Phases 5–8).
 
 This module is deliberately UI-free: it contains only the timeline
 state and pure time<->pixel scaling math. No Tkinter, no decoding, no
 file access. The source video file is referenced by path only and is
 NEVER copied, modified or re-encoded by the timeline.
 
-Scope (Phases 5–7):
+Scope (Phases 5–8):
 - data model: VideoClip, AudioClip, Timeline
 - timeline duration (== active video duration, 0 when no video)
 - audio clip placement with bounds clamping (Phase 7): a clip's start
   always stays within [0, duration] so clips never over-run the
   timeline; clips longer than the timeline pin to start 0
+- audio clip trimming (Phase 8): shrink a clip from its left or right
+  edge, never below MIN_AUDIO_CLIP_DURATION and never past the
+  timeline bounds; trimming never EXTENDS a clip
 - playhead position (seconds, clamped to the timeline)
 - time ruler tick selection
 - time <-> pixel scaling helpers
 - WAV duration probing via stdlib ``wave`` (Phase 6)
 
-Explicitly NOT implemented here (future phases): trimming, splitting,
-snapping, transitions, effects, mixing, export, project save/load.
+Explicitly NOT implemented here (future phases): video trimming,
+splitting, snapping, transitions, effects, mixing, export, project
+save/load.
 """
 
 from __future__ import annotations
@@ -37,6 +41,10 @@ _TICK_STEP_CANDIDATES = (
 #: Maximum number of ruler intervals we want across the timeline.
 _MAX_TICK_INTERVALS = 6
 
+#: Minimum duration of an audio clip after trimming, in seconds (Phase 8).
+#: Trimming can shorten a clip but never below this length.
+MIN_AUDIO_CLIP_DURATION = 0.1
+
 
 @dataclass
 class VideoClip:
@@ -53,10 +61,12 @@ class VideoClip:
 
 @dataclass
 class AudioClip:
-    """A non-destructive reference to an audio file (future phase).
+    """A non-destructive reference to an audio file on the AUDIO track.
 
-    Audio clips are part of the model already so the timeline state is
-    complete, but nothing places them on the timeline yet.
+    Only the path plus the placement (``start``) and ``duration`` on the
+    timeline are stored; the WAV file itself is never touched. Since
+    Phase 8 the clip can be trimmed (shortened) from either edge by
+    adjusting ``start`` / ``duration``.
     """
 
     source: Path
@@ -155,6 +165,59 @@ class Timeline:
             return
         clip = self.audio_clips[index]
         clip.start = self._clamp_start(start, clip.duration)
+
+    def trim_audio_clip(self, index: int, edge: str, new_time: float) -> None:
+        """Trim an audio clip from its ``"left"`` or ``"right"`` edge (Phase 8).
+
+        Trimming only ever SHRINKS the clip — dragging an edge outwards
+        never extends the clip beyond its original range:
+
+        - right edge: the new end is clamped into
+          ``[start + MIN_AUDIO_CLIP_DURATION, min(original end, timeline
+          duration)]``; ``start`` is unchanged.
+        - left edge: the new start is clamped into
+          ``[original start, end - MIN_AUDIO_CLIP_DURATION]`` (also never
+          past the timeline duration, so the Phase 7 invariant
+          ``start <= duration`` holds); the end is unchanged.
+
+        Invalid index/edge/time values are no-ops (same style as
+        ``move_audio_clip``). The source file is never touched.
+        """
+        if index < 0 or index >= len(self.audio_clips):
+            return
+        if edge not in ("left", "right"):
+            return
+        try:
+            new_time = float(new_time)
+        except (TypeError, ValueError):
+            return
+        if math.isnan(new_time) or math.isinf(new_time):
+            return
+        clip = self.audio_clips[index]
+        clip_start = clip.start
+        clip_end = clip.start + clip.duration
+        timeline = self.duration
+        if edge == "right":
+            lo = clip_start + MIN_AUDIO_CLIP_DURATION
+            hi = clip_end
+            if timeline > 0.0:
+                hi = min(hi, timeline)
+            if lo > hi:
+                return  # already at the minimum / degenerate bounds
+            new_end = max(lo, min(new_time, hi))
+            # max() guards against float rounding dipping below MIN.
+            clip.duration = max(MIN_AUDIO_CLIP_DURATION, new_end - clip_start)
+        else:  # edge == "left"
+            lo = clip_start
+            hi = clip_end - MIN_AUDIO_CLIP_DURATION
+            if timeline > 0.0:
+                hi = min(hi, timeline)
+            if lo > hi:
+                return  # already at the minimum / degenerate bounds
+            new_start = max(lo, min(new_time, hi))
+            clip.start = new_start
+            # max() guards against float rounding dipping below MIN.
+            clip.duration = max(MIN_AUDIO_CLIP_DURATION, clip_end - new_start)
 
     def clamp_audio_clips(self) -> None:
         """Re-clamp every audio clip into the current timeline bounds.

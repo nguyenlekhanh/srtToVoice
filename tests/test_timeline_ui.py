@@ -306,6 +306,131 @@ class SeekTests(TimelineAppTestCase):
         self.assertEqual(self.app.timeline.playhead, 0.0)
 
 
+class TrimClipTests(TimelineAppTestCase):
+    """Phase 8: drag the edges of a SELECTED audio clip to trim it."""
+
+    def _add_selected_clip(self, start: float, duration: float) -> None:
+        self.app.timeline.add_audio_clip(Path("clip.wav"), start, duration)
+        self.app.timeline.select_audio(0)
+        self.app._redraw_timeline()
+
+    def _trim_right_edge(self, to_seconds: float) -> None:
+        """Press the right edge of the selected clip, drag to ``to_seconds``."""
+        g = self.geometry()
+        y = self.audio_mid_y()
+        clip = self.app.timeline.audio_clips[0]
+        edge_x = self.time_to_canvas_x(clip.start + clip.duration)
+        # Press 3 px inside the right edge (within EDGE_GRAB_PX = 6).
+        self.app._on_timeline_click(self.canvas_event(edge_x - 3, y))
+        move_x = self.time_to_canvas_x(to_seconds)
+        self.app._on_global_drag_motion(self.root_event(move_x, y))
+        self.app._on_global_drag_release(self.root_event(move_x, y))
+
+    def _trim_left_edge(self, to_seconds: float) -> None:
+        """Press the left edge of the selected clip, drag to ``to_seconds``."""
+        g = self.geometry()
+        y = self.audio_mid_y()
+        clip = self.app.timeline.audio_clips[0]
+        edge_x = self.time_to_canvas_x(clip.start)
+        # Press 3 px inside the left edge (within EDGE_GRAB_PX = 6).
+        self.app._on_timeline_click(self.canvas_event(edge_x + 3, y))
+        move_x = self.time_to_canvas_x(to_seconds)
+        self.app._on_global_drag_motion(self.root_event(move_x, y))
+        self.app._on_global_drag_release(self.root_event(move_x, y))
+
+    def test_trim_right_edge_shrinks_clip(self):
+        self.load_video(10.0)
+        self._add_selected_clip(2.0, 4.0)  # [2, 6]
+        self._trim_right_edge(4.5)
+        clip = self.app.timeline.audio_clips[0]
+        self.assertAlmostEqual(clip.start, 2.0, delta=0.01)  # left fixed
+        self.assertAlmostEqual(clip.duration, 2.5, delta=0.2)
+
+    def test_trim_left_edge_shrinks_clip(self):
+        self.load_video(10.0)
+        self._add_selected_clip(2.0, 4.0)  # [2, 6]
+        self._trim_left_edge(3.5)
+        clip = self.app.timeline.audio_clips[0]
+        self.assertAlmostEqual(clip.start, 3.5, delta=0.2)
+        self.assertAlmostEqual(clip.start + clip.duration, 6.0, delta=0.01)
+
+    def test_trim_right_edge_outwards_never_extends(self):
+        self.load_video(10.0)
+        self._add_selected_clip(2.0, 4.0)
+        self._trim_right_edge(9.0)  # drag past the original end
+        clip = self.app.timeline.audio_clips[0]
+        self.assertAlmostEqual(clip.start, 2.0, delta=0.01)
+        self.assertAlmostEqual(clip.duration, 4.0, delta=0.01)  # unchanged
+
+    def test_trim_left_edge_outwards_never_extends(self):
+        self.load_video(10.0)
+        self._add_selected_clip(2.0, 4.0)
+        self._trim_left_edge(0.0)  # drag before the original start
+        clip = self.app.timeline.audio_clips[0]
+        self.assertAlmostEqual(clip.start, 2.0, delta=0.01)  # unchanged
+        self.assertAlmostEqual(clip.duration, 4.0, delta=0.01)
+
+    def test_trim_right_edge_respects_minimum_duration(self):
+        from app.timeline import MIN_AUDIO_CLIP_DURATION
+
+        self.load_video(10.0)
+        self._add_selected_clip(2.0, 4.0)
+        self._trim_right_edge(2.0)  # all the way to the start
+        clip = self.app.timeline.audio_clips[0]
+        self.assertGreaterEqual(clip.duration, MIN_AUDIO_CLIP_DURATION)
+
+    def test_trim_release_reports_range(self):
+        self.load_video(10.0)
+        self._add_selected_clip(2.0, 4.0)
+        self._trim_right_edge(4.5)
+        self.assertIn("Trimmed audio clip to", self.status())
+
+    def test_first_press_on_unselected_clip_is_move_not_trim(self):
+        # Phase 7 behavior preserved: first press near the edge of an
+        # UNSELECTED clip selects it and starts a MOVE drag, not a trim.
+        self.load_video(10.0)
+        self.app.timeline.add_audio_clip(Path("clip.wav"), 2.0, 4.0)
+        self.app._redraw_timeline()
+        g = self.geometry()
+        y = self.audio_mid_y()
+        edge_x = self.time_to_canvas_x(6.0)  # right edge
+        self.app._on_timeline_click(self.canvas_event(edge_x - 3, y))
+        # The drag kind must be "clip" (move), not "trim".
+        self.assertEqual(self.app._drag["kind"], "clip")
+        self.assertEqual(self.app.timeline.selected_audio, 0)
+
+    def test_hover_cursor_over_selected_clip_edge(self):
+        self.load_video(10.0)
+        self._add_selected_clip(2.0, 4.0)
+        y = self.audio_mid_y()
+        edge_x = self.time_to_canvas_x(6.0)  # right edge
+        self.app._on_timeline_motion(self.canvas_event(edge_x - 2, y))
+        self.assertEqual(self.app.timeline_canvas.cget("cursor"), "sb_h_double_arrow")
+
+    def test_hover_cursor_normal_away_from_edge(self):
+        self.load_video(10.0)
+        self._add_selected_clip(2.0, 4.0)
+        y = self.audio_mid_y()
+        mid_x = self.time_to_canvas_x(4.0)  # clip body, away from edges
+        self.app._on_timeline_motion(self.canvas_event(mid_x, y))
+        self.assertEqual(self.app.timeline_canvas.cget("cursor"), "")
+
+    def test_selected_clip_draws_edge_handles(self):
+        self.load_video(10.0)
+        self._add_selected_clip(2.0, 4.0)
+        canvas = self.app.timeline_canvas
+        handles = canvas.find_withtag("clip_handle")
+        self.assertEqual(len(handles), 2)  # left + right edge handles
+
+    def test_unselected_clip_draws_no_handles(self):
+        self.load_video(10.0)
+        self.app.timeline.add_audio_clip(Path("clip.wav"), 2.0, 4.0)
+        self.app._redraw_timeline()
+        canvas = self.app.timeline_canvas
+        handles = canvas.find_withtag("clip_handle")
+        self.assertEqual(len(handles), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

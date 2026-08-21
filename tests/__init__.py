@@ -1,1 +1,1 @@
-"""Test package for the local video editor (Phase 7)."""
+"""Test package for the local video editor (Phase 8)."""

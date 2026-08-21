@@ -1,10 +1,10 @@
-# Local Video Editor (Phase 4 — Video Upload + Preview)
+# Local Video Editor (Phase 8 — Audio Clip Trimming)
 
 A local desktop application that will become a simple CapCut-like video
-editor with local Piper TTS. Phase 4 adds local video upload and
-preview: upload ONE video file and play it in the Video Preview area
-with play/pause/stop, seek, time display, volume and mute. The original
-video file is only read — never copied, modified or re-encoded.
+editor with local Piper TTS. Phase 8 adds audio clip trimming: drag the
+left or right edge of an audio clip on the timeline to shorten it. The
+underlying WAV files are only referenced — never copied, modified or
+re-encoded.
 
 ## Current status
 
@@ -17,8 +17,35 @@ video file is only read — never copied, modified or re-encoded.
   the selected voice with Piper; Stop supported; cached per voice
 - **Video Preview** — WORKING: real preview with Play/Pause, Stop,
   seek slider, current time / duration, volume slider and Mute
-- **Timeline** — empty timeline area (placeholder)
+- **Timeline** — WORKING: ruler + VIDEO/AUDIO tracks, playhead synced
+  with the video preview, drag & drop WAVs onto the AUDIO track, move
+  and select audio clips, bounds clamping, and (Phase 8) trimming audio
+  clips by dragging their edges
 - **Export** — Export button (placeholder)
+
+## Timeline + Audio Clip Trimming (Phases 5–8)
+
+- The timeline shows a time ruler, a VIDEO track and an AUDIO track,
+  plus a playhead that stays in sync with the Video Preview. Clicking
+  the timeline seeks the video; the video's current time moves the
+  playhead.
+- Drag a WAV from the Assets panel onto the AUDIO track to place it.
+  WAVs longer than the timeline are rejected with a status message.
+  Clips are clamped so they never over-run the timeline bounds.
+- Press an audio clip to select it, then drag its body to move it.
+  Clicking anywhere that is not a clip deselects it. Overlapping clips
+  resolve to the topmost one. Audio clips survive video changes
+  (re-clamped into the new duration).
+- **Phase 8 — trimming:** with a clip already selected, drag its left or
+  right edge to shorten it. Trimming only ever SHRINKS a clip (dragging
+  an edge outwards never extends it), never goes below
+  `MIN_AUDIO_CLIP_DURATION` (0.1 s), and never crosses the timeline
+  bounds. A resize cursor appears while hovering over the selected
+  clip's edges, and the selected clip shows edge handles. The status bar
+  reports the trimmed range on release. The WAV files are never touched.
+- Not included (by design, later phases): video trimming, splitting,
+  snapping, transitions, undo/redo, audio mixing/playback of timeline
+  clips, export/rendering, save/load.
 
 ## Video Upload + Preview (Phase 4)
 
@@ -107,10 +134,12 @@ project/
 ├── app/
 │   ├── __init__.py
 │   ├── main.py          # UI entry point
+│   ├── timeline.py      # timeline data model (no UI, no file access)
 │   ├── voice_library.py # voice scanning / metadata logic (no UI)
 │   ├── voice_preview.py # Piper preview generation + playback (no UI)
 │   ├── srt_voice.py     # SRT parsing + Piper WAV generation (no UI)
 │   └── video_preview.py # video probing + preview playback (no UI)
+├── tests/          # unittest suite (model + UI interaction tests)
 ├── voices/         # Piper voice models (.onnx + .onnx.json), any nesting
 ├── generated/
 │   ├── previews/   # cached preview WAVs (created on first preview)
@@ -135,6 +164,10 @@ From the project root:
 
 ## Roadmap (not implemented yet)
 
-- Timeline editing (placing video/audio on a timeline)
-- Audio placement / synchronization with video
+- Video clip trimming
+- Splitting clips
+- Snapping / transitions
+- Undo / redo
+- Audio mixing / playback of timeline clips
 - FFmpeg export
+- Project save / load

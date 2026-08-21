@@ -1,8 +1,8 @@
-"""Pure model tests for app.timeline (Phase 7).
+"""Pure model tests for app.timeline (Phases 7–8).
 
 No Tkinter, no UI: these tests exercise the timeline data model only —
 bounds clamping, hit-testing, selection, playhead, scaling roundtrip,
-ruler ticks and stdlib WAV duration probing.
+ruler ticks, stdlib WAV duration probing and audio clip trimming.
 
 Run from the project root:
     .venv\\Scripts\\python.exe -m unittest discover -s tests
@@ -16,6 +16,7 @@ import wave
 from pathlib import Path
 
 from app.timeline import (
+    MIN_AUDIO_CLIP_DURATION,
     Timeline,
     format_ruler_label,
     probe_wav_duration,
@@ -138,6 +139,146 @@ class AudioClipBoundsTests(unittest.TestCase):
         tl.move_audio_clip(-1, 5.0)
         tl.move_audio_clip(7, 5.0)
         self.assertEqual(tl.audio_clips[0].start, 1.0)
+
+
+class AudioClipTrimTests(unittest.TestCase):
+    """Phase 8: trimming only ever SHRINKS a clip, never extends it."""
+
+    def test_trim_right_edge_moves_end_inward(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 2.0, 4.0)  # [2, 6]
+        tl.trim_audio_clip(0, "right", 4.5)
+        clip = tl.audio_clips[0]
+        self.assertEqual(clip.start, 2.0)  # left edge fixed
+        self.assertAlmostEqual(clip.duration, 2.5)  # end now 4.5
+
+    def test_trim_left_edge_moves_start_inward(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 2.0, 4.0)  # [2, 6]
+        tl.trim_audio_clip(0, "left", 3.5)
+        clip = tl.audio_clips[0]
+        self.assertAlmostEqual(clip.start, 3.5)
+        self.assertAlmostEqual(clip.duration, 2.5)  # end stays at 6
+
+    def test_trim_right_edge_outwards_never_extends(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 2.0, 4.0)
+        tl.trim_audio_clip(0, "right", 9.0)  # past the original end
+        clip = tl.audio_clips[0]
+        self.assertEqual(clip.start, 2.0)
+        self.assertEqual(clip.duration, 4.0)  # unchanged
+
+    def test_trim_left_edge_outwards_never_extends(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 2.0, 4.0)
+        tl.trim_audio_clip(0, "left", 0.0)  # before the original start
+        clip = tl.audio_clips[0]
+        self.assertEqual(clip.start, 2.0)  # unchanged
+        self.assertEqual(clip.duration, 4.0)
+
+    def test_trim_right_edge_respects_minimum_duration(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 2.0, 4.0)
+        tl.trim_audio_clip(0, "right", 2.0)  # all the way to the start
+        clip = tl.audio_clips[0]
+        self.assertEqual(clip.start, 2.0)
+        # Hard invariant: never below the minimum (float-exact).
+        self.assertGreaterEqual(clip.duration, MIN_AUDIO_CLIP_DURATION)
+        self.assertAlmostEqual(clip.duration, MIN_AUDIO_CLIP_DURATION)
+
+    def test_trim_left_edge_respects_minimum_duration(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 2.0, 4.0)
+        tl.trim_audio_clip(0, "left", 9.0)  # past the end
+        clip = tl.audio_clips[0]
+        self.assertAlmostEqual(clip.start, 6.0 - MIN_AUDIO_CLIP_DURATION)
+        self.assertAlmostEqual(clip.duration, MIN_AUDIO_CLIP_DURATION)
+
+    def test_trim_right_edge_of_overrunning_clip_caps_at_timeline(self):
+        # Over-running clips cannot be created via the UI (Phase 7
+        # rejects them on drop) but the model must handle them.
+        tl = make_timeline(10.0)
+        clip = tl.add_audio_clip(FAKE_WAV, 0.0, 12.0)
+        tl.trim_audio_clip(0, "right", 11.0)
+        self.assertEqual(clip.duration, 10.0)  # capped at timeline end
+        tl.trim_audio_clip(0, "right", 7.0)
+        self.assertEqual(clip.duration, 7.0)
+
+    def test_trim_left_edge_of_overrunning_clip_keeps_phase7_invariant(self):
+        tl = make_timeline(10.0)
+        clip = tl.add_audio_clip(FAKE_WAV, 0.0, 12.0)
+        tl.trim_audio_clip(0, "left", 11.0)
+        # hi = min(12 - MIN, 10) = 10 -> start capped at the duration.
+        self.assertEqual(clip.start, 10.0)
+        self.assertAlmostEqual(clip.duration, 2.0)
+        self.assertLessEqual(clip.start, tl.duration)
+
+    def test_trim_keeps_source(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 1.0, 3.0)
+        tl.trim_audio_clip(0, "right", 2.0)
+        self.assertEqual(tl.audio_clips[0].source, FAKE_WAV)
+
+    def test_trim_invalid_index_is_noop(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 1.0, 2.0)
+        tl.trim_audio_clip(-1, "right", 2.0)
+        tl.trim_audio_clip(5, "left", 2.0)
+        self.assertEqual(tl.audio_clips[0].start, 1.0)
+        self.assertEqual(tl.audio_clips[0].duration, 2.0)
+
+    def test_trim_invalid_edge_is_noop(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 1.0, 2.0)
+        tl.trim_audio_clip(0, "middle", 2.0)
+        tl.trim_audio_clip(0, "", 2.0)
+        self.assertEqual(tl.audio_clips[0].start, 1.0)
+        self.assertEqual(tl.audio_clips[0].duration, 2.0)
+
+    def test_trim_invalid_time_values_are_noops(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 1.0, 2.0)
+        tl.trim_audio_clip(0, "right", float("nan"))
+        tl.trim_audio_clip(0, "right", float("inf"))
+        tl.trim_audio_clip(0, "left", float("-inf"))
+        tl.trim_audio_clip(0, "left", "not a number")
+        tl.trim_audio_clip(0, "left", None)
+        self.assertEqual(tl.audio_clips[0].start, 1.0)
+        self.assertEqual(tl.audio_clips[0].duration, 2.0)
+
+    def test_trim_minimum_duration_clip_stays_at_minimum(self):
+        # A clip already at the minimum cannot be shrunk further; the
+        # result stays at the minimum (within float tolerance).
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 2.0, MIN_AUDIO_CLIP_DURATION)
+        tl.trim_audio_clip(0, "right", 2.05)
+        clip = tl.audio_clips[0]
+        self.assertAlmostEqual(clip.start, 2.0)
+        self.assertGreaterEqual(clip.duration, MIN_AUDIO_CLIP_DURATION)
+        self.assertAlmostEqual(clip.duration, MIN_AUDIO_CLIP_DURATION)
+        tl.trim_audio_clip(0, "left", 2.05)
+        clip = tl.audio_clips[0]
+        self.assertGreaterEqual(clip.duration, MIN_AUDIO_CLIP_DURATION)
+        self.assertAlmostEqual(clip.duration, MIN_AUDIO_CLIP_DURATION)
+        self.assertAlmostEqual(clip.start + clip.duration, 2.1)
+
+    def test_trim_on_empty_timeline_still_shrinks(self):
+        # No video -> timeline duration 0 -> no timeline cap, but the
+        # clip can still be shrunk within its own range.
+        tl = Timeline()
+        tl.add_audio_clip(FAKE_WAV, 0.0, 2.0)
+        tl.trim_audio_clip(0, "right", 1.0)
+        self.assertEqual(tl.audio_clips[0].duration, 1.0)
+
+    def test_trim_only_affects_target_clip(self):
+        tl = make_timeline(10.0)
+        tl.add_audio_clip(FAKE_WAV, 1.0, 2.0)
+        tl.add_audio_clip(FAKE_WAV, 5.0, 2.0)
+        tl.trim_audio_clip(1, "left", 6.0)
+        self.assertEqual(tl.audio_clips[0].start, 1.0)
+        self.assertEqual(tl.audio_clips[0].duration, 2.0)
+        self.assertEqual(tl.audio_clips[1].start, 6.0)
+        self.assertEqual(tl.audio_clips[1].duration, 1.0)
 
 
 class ClampOnDurationChangeTests(unittest.TestCase):

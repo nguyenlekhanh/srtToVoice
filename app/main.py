@@ -33,6 +33,13 @@ Export.
   clips resolve to the topmost one, and audio clips survive video
   changes (re-clamped into the new duration). No trimming, snapping,
   undo/redo or mixing yet.
+- Phase 8: audio clip trimming. Dragging the left or right edge of an
+  already-selected audio clip trims (shortens) it live; trimming never
+  EXTENDS a clip, never goes below MIN_AUDIO_CLIP_DURATION and never
+  crosses the timeline bounds. A resize cursor appears while hovering
+  over the edges of the selected clip, and the selected clip shows
+  edge handles. The WAV files are never touched. No video trimming,
+  splitting, snapping, undo/redo or mixing yet.
 
 Export remains a placeholder.
 
@@ -82,7 +89,7 @@ from app.voice_preview import (
     stop_sound,
 )
 
-APP_TITLE = "Local Video Editor — Phase 7 (Timeline Editing Workflow)"
+APP_TITLE = "Local Video Editor — Phase 8 (Audio Clip Trimming)"
 COMING_SOON = "Coming in next phases"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -114,6 +121,13 @@ AUDIO_CLIP_EDGE = "#3d8f3d"
 AUDIO_CLIP_TEXT = "#123012"
 AUDIO_CLIP_SELECTED_FILL = "#a6e3a6"
 AUDIO_CLIP_SELECTED_EDGE = "#1f7a1f"
+
+# Phase 8 trim UI constants.
+#: Pointer distance (px) from a selected clip's edge that grabs it for
+#: trimming. Small enough to keep clip-body presses as Phase 7 moves.
+EDGE_GRAB_PX = 6
+#: Drawn width (px) of the trim handles on the selected clip's edges.
+CLIP_HANDLE_W = 4.0
 
 
 class App(tk.Tk):
@@ -162,6 +176,7 @@ class App(tk.Tk):
         # small dict describing an in-progress drag:
         #   {"kind": "media", "path": Path}  (asset dragged from Media panel)
         #   {"kind": "clip", "index": int, "offset": float}  (clip being moved)
+        #   {"kind": "trim", "index": int, "edge": "left"|"right"}  (Phase 8)
         self._drag = None
 
         self._build_layout()
@@ -1182,8 +1197,12 @@ class App(tk.Tk):
         )
         self.timeline_canvas.grid(row=0, column=0, sticky="nsew")
         self.timeline_canvas.bind("<Configure>", self._on_timeline_resize)
-        # Click / press handling (seek, or audio-clip move).
+        # Click / press handling (seek, or audio-clip move/trim).
         self.timeline_canvas.bind("<Button-1>", self._on_timeline_click)
+        # Phase 8: hover feedback (resize cursor over the selected clip's
+        # edges). <Motion> only fires while the pointer is over the canvas
+        # and no button is held, so it never interferes with drags.
+        self.timeline_canvas.bind("<Motion>", self._on_timeline_motion)
 
         self._redraw_timeline()
 
@@ -1353,6 +1372,17 @@ class App(tk.Tk):
                     fill=AUDIO_CLIP_TEXT, font=("Segoe UI", 8),
                     tags=("audio_track", "audio_clip"),
                 )
+            # Phase 8: trim handles on the selected clip's edges. Tagged
+            # "clip_handle" (NOT "audio_clip") so Phase 7 canvas-fill
+            # assertions are unaffected.
+            if index == self.timeline.selected_audio:
+                for hx in (ax0, ax1):
+                    canvas.create_rectangle(
+                        hx - CLIP_HANDLE_W / 2, g["audio_top"] + 1,
+                        hx + CLIP_HANDLE_W / 2, g["audio_bottom"] - 1,
+                        fill=AUDIO_CLIP_SELECTED_EDGE, outline="",
+                        tags=("audio_track", "clip_handle"),
+                    )
 
         self._update_playhead()
 
@@ -1389,6 +1419,8 @@ class App(tk.Tk):
 
         - Press over an AudioClip on the AUDIO track -> select it and
           begin a move drag.
+        - Phase 8: press near the left/right edge of an ALREADY SELECTED
+          clip -> begin a trim drag instead of a move.
         - Press anywhere else (ruler, VIDEO track, empty AUDIO track) ->
           deselect any selected audio clip (Phase 7) and seek.
         """
@@ -1404,8 +1436,26 @@ class App(tk.Tk):
                 seconds, g["audio_top"], g["audio_bottom"]
             )
             if index is not None:
+                # Phase 8: an edge press on an ALREADY SELECTED clip grabs
+                # that edge for trimming. The "already selected" check must
+                # happen BEFORE select_audio() below; selection gating keeps
+                # the Phase 7 behavior (first press = select + move) intact.
+                was_selected = self.timeline.selected_audio == index
                 self.timeline.select_audio(index)
                 clip = self.timeline.audio_clips[index]
+                edge = (
+                    self._edge_under_pointer(event.x, clip, g)
+                    if was_selected
+                    else None
+                )
+                if edge is not None:
+                    self._drag = {"kind": "trim", "index": index, "edge": edge}
+                    self._redraw_timeline()
+                    self._set_status(
+                        f"Trimming {clip.source.name}: drag the {edge} edge "
+                        f"to shorten the clip."
+                    )
+                    return
                 self._drag = {
                     "kind": "clip",
                     "index": index,
@@ -1437,6 +1487,44 @@ class App(tk.Tk):
             self.video_player.seek(target)
             self.after(150, self._clear_seek_pending)
         self._set_status(f"Timeline seeked to {format_timecode(target)}.")
+
+    def _edge_under_pointer(self, x: float, clip, g: dict) -> Optional[str]:
+        """Phase 8: return "left"/"right" if ``x`` is within EDGE_GRAB_PX
+        of ``clip``'s edge (in canvas pixels), else None.
+
+        Only meaningful for the selected clip (callers gate on that).
+        """
+        left_x = self.timeline.time_to_x(clip.start, g["left"], g["width"])
+        right_x = self.timeline.time_to_x(
+            clip.start + clip.duration, g["left"], g["width"]
+        )
+        if abs(x - left_x) <= EDGE_GRAB_PX:
+            return "left"
+        if abs(x - right_x) <= EDGE_GRAB_PX:
+            return "right"
+        return None
+
+    def _on_timeline_motion(self, event: tk.Event) -> None:
+        """Phase 8: hover feedback — resize cursor over the selected
+        clip's edges, normal cursor everywhere else.
+
+        Bound to <Motion> on the timeline canvas, which only fires while
+        the pointer is over the canvas and no button is held, so this
+        never interferes with drags.
+        """
+        g = self._timeline_geometry()
+        cursor = ""
+        index = self.timeline.selected_audio
+        if (
+            index is not None
+            and 0 <= index < len(self.timeline.audio_clips)
+            and g["audio_top"] <= event.y <= g["audio_bottom"]
+            and g["left"] <= event.x <= g["left"] + g["width"]
+        ):
+            clip = self.timeline.audio_clips[index]
+            if self._edge_under_pointer(event.x, clip, g) is not None:
+                cursor = "sb_h_double_arrow"
+        self.timeline_canvas.config(cursor=cursor)
 
     def _on_asset_drag_start(self, wav_path: Path) -> None:
         """Begin an audio-asset drag from the Media panel (Phase 6).
@@ -1481,6 +1569,21 @@ class App(tk.Tk):
             actual = self.timeline.audio_clips[self._drag["index"]].start
             self._set_status(
                 f"Moving audio clip to {format_timecode(actual)}."
+            )
+            return
+
+        if self._drag["kind"] == "trim":
+            # Phase 8: live trim. The model clamps the new edge into the
+            # shrink-only range, so dragging outwards is a harmless no-op.
+            seconds = self.timeline.x_to_time(xc, g["left"], g["width"])
+            self.timeline.trim_audio_clip(
+                self._drag["index"], self._drag["edge"], seconds
+            )
+            self._redraw_timeline()
+            clip = self.timeline.audio_clips[self._drag["index"]]
+            self._set_status(
+                f"Trimming audio clip: {format_timecode(clip.start)}\u2013"
+                f"{format_timecode(clip.start + clip.duration)}."
             )
             return
 
@@ -1542,6 +1645,16 @@ class App(tk.Tk):
                     f"Added audio clip {drag['path'].name} "
                     f"({format_timecode(duration)}) at "
                     f"{format_timecode(start)}."
+                )
+        elif drag["kind"] == "trim":
+            # Phase 8: report the final trimmed range.
+            self._redraw_timeline()
+            idx = drag["index"]
+            if 0 <= idx < len(self.timeline.audio_clips):
+                clip = self.timeline.audio_clips[idx]
+                self._set_status(
+                    f"Trimmed audio clip to {format_timecode(clip.start)}\u2013"
+                    f"{format_timecode(clip.start + clip.duration)}."
                 )
         else:  # kind == "clip"
             self._redraw_timeline()
