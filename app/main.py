@@ -1,5 +1,5 @@
-"""Local CapCut-like editor skeleton: Voice Library, Voice Preview and
-SRT voice generation.
+"""Local CapCut-like editor skeleton: Voice Library, Voice Preview,
+SRT voice generation and video preview.
 
 Tkinter UI with five sections: Media, Voice, Video Preview, Timeline,
 Export.
@@ -13,8 +13,12 @@ Export.
   synthesizes the complete subtitle text into exactly ONE WAV in
   ``generated/`` using the selected Piper voice. The SRT timestamps
   are only a text source — no timeline placement happens.
+- Phase 4: ``Upload Video`` picks ONE local video file and shows it in
+  the Video Preview area with play/pause/stop, seek, time display,
+  volume and mute. The original file is only read — never copied,
+  modified or re-encoded. No timeline placement, trimming or export.
 
-Video Preview, Timeline and Export remain placeholders.
+Timeline and Export remain placeholders.
 
 Run with the project's .venv:
     .venv\\Scripts\\python.exe -m app.main
@@ -30,11 +34,20 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Callable, List, Optional
 
+from PIL import Image, ImageTk
+
 from app.srt_voice import (
     SrtError,
     generate_voice_wav,
     new_voice_wav_path,
     parse_srt_text,
+)
+from app.video_preview import (
+    SUPPORTED_VIDEO_EXTENSIONS,
+    VideoError,
+    VideoPlayer,
+    format_timecode,
+    probe_video,
 )
 from app.voice_library import (
     NO_VOICES_MESSAGE,
@@ -52,7 +65,7 @@ from app.voice_preview import (
     stop_sound,
 )
 
-APP_TITLE = "Local Video Editor — Phase 3 (SRT Voice Generation)"
+APP_TITLE = "Local Video Editor — Phase 4 (Video Upload + Preview)"
 COMING_SOON = "Coming in next phases"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -95,10 +108,18 @@ class App(tk.Tk):
         self._voice_playing = False
         self._voice_play_token = 0  # invalidates stale playback callbacks
 
+        # Phase 4 state: uploaded video + preview player.
+        self.video_path: Optional[Path] = None
+        self.video_player: Optional[VideoPlayer] = None
+        self._video_photo: Optional[ImageTk.PhotoImage] = None  # keep ref
+        self._video_seek_pending = False  # suppress seek-slider feedback
+        self._video_tick_token = 0  # invalidates stale tick callbacks
+
         self._build_layout()
 
         self._refresh_voices(initial=True)
-        self.after(50, self._poll_ui_queue)
+        self._poll_after_id = self.after(50, self._poll_ui_queue)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------- thread-safe UI updates
 
@@ -118,7 +139,7 @@ class App(tk.Tk):
                     pass
         except queue.Empty:
             pass
-        self.after(50, self._poll_ui_queue)
+        self._poll_after_id = self.after(50, self._poll_ui_queue)
 
     # ------------------------------------------------------------------ UI
 
@@ -159,11 +180,20 @@ class App(tk.Tk):
         sidebar = ttk.Frame(parent)
         sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 8))
 
-        # 1. Media (Phase 3: SRT upload + voice generation)
+        # 1. Media (Phase 3: SRT upload + voice generation,
+        #           Phase 4: video upload)
         media = self._section(sidebar, "Media")
-        self._coming_soon_button(media, "Upload Video").pack(
-            fill=tk.X, pady=2
+        ttk.Button(
+            media, text="Upload Video", command=self._on_upload_video
+        ).pack(fill=tk.X, pady=2)
+        self.video_label = ttk.Label(
+            media,
+            text="Video: (none)",
+            foreground="#444444",
+            wraplength=260,
+            justify="left",
         )
+        self.video_label.pack(anchor="w", padx=2)
         ttk.Button(media, text="Upload SRT", command=self._on_upload_srt).pack(
             fill=tk.X, pady=2
         )
@@ -198,7 +228,7 @@ class App(tk.Tk):
 
         note = ttk.Label(
             sidebar,
-            text="Video Preview, Timeline and Export\nare placeholders for now.",
+            text="Timeline and Export are placeholders for now.",
             foreground="#666666",
         )
         note.pack(anchor="w", pady=(4, 0))
@@ -651,15 +681,37 @@ class App(tk.Tk):
         self._set_status(f"{message} -> {wav_path.name}")
 
     def _rebuild_assets_list(self) -> None:
-        """Show generated WAVs as playable media assets (no timeline)."""
+        """Show the uploaded video + generated WAVs as media assets."""
         for child in self.assets_frame.winfo_children():
             child.destroy()
 
         ttk.Label(
             self.assets_frame,
-            text="Audio:",
+            text="Video:",
             font=("Segoe UI", 9, "bold"),
         ).pack(anchor="w")
+
+        if self.video_path is None:
+            ttk.Label(
+                self.assets_frame,
+                text="No video uploaded yet.",
+                foreground="#888888",
+            ).pack(anchor="w", pady=(0, 2))
+        else:
+            row = ttk.Frame(self.assets_frame)
+            row.pack(fill=tk.X, pady=1)
+            row.columnconfigure(0, weight=1)
+            ttk.Label(
+                row,
+                text=f"\U0001F3AC {self.video_path.name}",
+                wraplength=230,
+            ).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(
+            self.assets_frame,
+            text="Audio:",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w", pady=(4, 0))
 
         if not self.generated_wavs:
             ttk.Label(
@@ -742,29 +794,291 @@ class App(tk.Tk):
         self._set_voice_status("Stopped.")
         self._set_status("Audio playback stopped.")
 
+    # ------------------------------------- Phase 4: video upload + preview
+
+    def _on_upload_video(self) -> None:
+        """Pick ONE local video file and load it into the preview."""
+        filetypes = [
+            ("Video files", " ".join(f"*{ext}" for ext in sorted(
+                SUPPORTED_VIDEO_EXTENSIONS
+            ))),
+            ("All files", "*.*"),
+        ]
+        file_path = filedialog.askopenfilename(
+            title="Select a video file",
+            filetypes=filetypes,
+        )
+        if not file_path:
+            return  # user cancelled -> do nothing
+        self._load_video(Path(file_path))
+
+    def _load_video(self, path: Path) -> None:
+        """Validate, probe and activate a video for preview."""
+        # Stop any current playback and release the previous player.
+        self._teardown_video_player()
+
+        try:
+            info = probe_video(path)
+        except VideoError as exc:
+            self._set_status(str(exc))
+            self.video_label.configure(text="Video: (none)")
+            self._rebuild_assets_list()
+            return
+
+        # Create the player wired to this UI.
+        try:
+            self.video_player = VideoPlayer(
+                path,
+                on_frame=self._on_video_frame,
+                on_tick=self._on_video_tick,
+                on_finished=self._on_video_finished,
+                on_error=self._on_video_error,
+            )
+        except VideoError as exc:
+            self._set_status(str(exc))
+            self.video_label.configure(text="Video: (none)")
+            return
+
+        self.video_path = path
+        self._video_tick_token += 1
+
+        # Update UI state.
+        self.video_label.configure(text=f"Video: {path.name}")
+        self._rebuild_assets_list()
+        self._set_video_controls_enabled(True)
+        self._update_time_label(0.0, info.duration)
+        self.seek_var.set(0.0)
+        self.seek_slider.configure(to=info.duration)
+        self._set_status(
+            f"Video loaded: {path.name} "
+            f"({info.width}x{info.height}, {format_timecode(info.duration)})"
+        )
+
+        # Show the first frame as a poster.
+        self.video_player.show_first_frame()
+
+    def _teardown_video_player(self) -> None:
+        """Stop and discard the current video player, if any."""
+        if self.video_player is not None:
+            self.video_player.close()
+            self.video_player = None
+        self._video_tick_token += 1
+
+    def _set_video_controls_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        self.play_pause_button.configure(state=state)
+        self.stop_video_button.configure(state=state)
+        self.seek_slider.configure(state=state)
+        self.mute_button.configure(state=state)
+        self.volume_slider.configure(state=state)
+        if not enabled:
+            self.play_pause_button.configure(text="\u25B6 Play")
+
+    def _on_video_frame(self, image) -> None:
+        """Receive a decoded frame (PIL image) from the player thread."""
+        self._run_on_ui_thread(lambda: self._draw_video_frame(image))
+
+    def _draw_video_frame(self, image) -> None:
+        canvas = self.preview_canvas
+        cw = canvas.winfo_width()
+        ch = canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+        # Fit the frame into the canvas while preserving aspect ratio.
+        iw, ih = image.size
+        scale = min(cw / iw, ch / ih)
+        new_w = max(1, int(iw * scale))
+        new_h = max(1, int(ih * scale))
+        if (new_w, new_h) != (iw, ih):
+            image = image.resize((new_w, new_h), Image.LANCZOS)
+        self._video_photo = ImageTk.PhotoImage(image)
+        canvas.delete("placeholder")
+        canvas.delete("frame")
+        canvas.create_image(cw / 2, ch / 2, image=self._video_photo, tags="frame")
+
+    def _on_preview_resize(self, event: tk.Event) -> None:
+        canvas = self.preview_canvas
+        if self.video_player is None:
+            canvas.coords("placeholder", event.width / 2, event.height / 2)
+            return
+        # Re-render a frame so the image fits the new canvas size.
+        if not self.video_player.is_active:
+            self.video_player.show_first_frame()
+
+    def _on_video_tick(self, position: float, duration: float) -> None:
+        token = self._video_tick_token
+        self._run_on_ui_thread(
+            lambda: self._apply_video_tick(token, position, duration)
+        )
+
+    def _apply_video_tick(
+        self, token: int, position: float, duration: float
+    ) -> None:
+        if token != self._video_tick_token:
+            return  # superseded by a newer video
+        self._update_time_label(position, duration)
+        if not self._video_seek_pending and duration > 0:
+            self.seek_var.set(position)
+
+    def _update_time_label(self, position: float, duration: float) -> None:
+        self.time_label.configure(
+            text=f"{format_timecode(position)} / {format_timecode(duration)}"
+        )
+
+    def _on_video_finished(self) -> None:
+        self._run_on_ui_thread(self._handle_video_finished)
+
+    def _handle_video_finished(self) -> None:
+        if self.video_player is None:
+            return
+        duration = self.video_player.duration
+        self._update_time_label(duration, duration)
+        self.play_pause_button.configure(text="\u25B6 Play")
+        self._set_status("Video playback finished.")
+
+    def _on_video_error(self, message: str) -> None:
+        self._run_on_ui_thread(lambda: self._handle_video_error(message))
+
+    def _handle_video_error(self, message: str) -> None:
+        self.play_pause_button.configure(text="\u25B6 Play")
+        self._set_status(message)
+
+    def _on_play_pause(self) -> None:
+        if self.video_player is None:
+            return
+        if self.video_player.is_playing:
+            self.video_player.pause()
+            self.play_pause_button.configure(text="\u25B6 Play")
+            self._set_status("Video paused.")
+        else:
+            self.video_player.play()
+            self.play_pause_button.configure(text="\u23F8 Pause")
+            self._set_status("Playing video...")
+
+    def _on_stop_video(self) -> None:
+        if self.video_player is None:
+            return
+        self.video_player.stop()
+        self.play_pause_button.configure(text="\u25B6 Play")
+        self._update_time_label(0.0, self.video_player.duration)
+        self.seek_var.set(0.0)
+        self._set_status("Video stopped.")
+
+    def _on_seek_drag(self, _value: str) -> None:
+        if self.video_player is None:
+            return
+        self._video_seek_pending = True
+        target = float(self.seek_var.get())
+        self.video_player.seek(target)
+        self._update_time_label(target, self.video_player.duration)
+        # Allow tick updates to resume shortly after the seek settles.
+        self.after(150, self._clear_seek_pending)
+
+    def _clear_seek_pending(self) -> None:
+        self._video_seek_pending = False
+
+    def _on_volume_change(self, _value: str) -> None:
+        if self.video_player is None:
+            return
+        self.video_player.set_volume(float(self.volume_var.get()))
+
+    def _on_mute_toggle(self) -> None:
+        if self.video_player is None:
+            return
+        self.video_player.set_muted(bool(self.mute_var.get()))
+
+    def _on_close(self) -> None:
+        """Clean shutdown: stop video playback, then destroy the window."""
+        try:
+            self.after_cancel(self._poll_after_id)
+        except Exception:
+            pass
+        self._teardown_video_player()
+        self.destroy()
+
     def _build_preview(self, parent: ttk.Widget) -> None:
-        # 3. Video Preview
+        # 3. Video Preview (Phase 4)
         preview_frame = ttk.LabelFrame(parent, text="Video Preview", padding=4)
         preview_frame.grid(row=0, column=1, sticky="nsew")
+        preview_frame.rowconfigure(0, weight=1)
+        preview_frame.columnconfigure(0, weight=1)
 
-        canvas = tk.Canvas(
+        self.preview_canvas = tk.Canvas(
             preview_frame,
             bg=PREVIEW_BG,
             highlightthickness=0,
         )
-        canvas.pack(fill=tk.BOTH, expand=True)
-        canvas.bind(
-            "<Configure>",
-            lambda e: canvas.coords("text", e.width / 2, e.height / 2),
-        )
-        canvas.create_text(
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        self.preview_canvas.bind("<Configure>", self._on_preview_resize)
+        self._preview_placeholder_id = self.preview_canvas.create_text(
             0,
             0,
-            text="Video preview — coming in next phases",
+            text="Upload a video to preview it here",
             fill="#8a8a8a",
             font=("Segoe UI", 11),
-            tags="text",
+            tags="placeholder",
         )
+        self.preview_canvas.coords(
+            "placeholder",
+            self.preview_canvas.winfo_width() / 2,
+            self.preview_canvas.winfo_height() / 2,
+        )
+
+        # --- Playback controls row ---
+        controls = ttk.Frame(preview_frame)
+        controls.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        controls.columnconfigure(2, weight=1)
+
+        self.play_pause_button = ttk.Button(
+            controls, text="\u25B6 Play", command=self._on_play_pause,
+            state="disabled", width=10,
+        )
+        self.play_pause_button.grid(row=0, column=0, padx=(0, 4))
+
+        self.stop_video_button = ttk.Button(
+            controls, text="\u25A0 Stop", command=self._on_stop_video,
+            state="disabled", width=10,
+        )
+        self.stop_video_button.grid(row=0, column=1, padx=(0, 8))
+
+        # Seek slider
+        self.seek_var = tk.DoubleVar(value=0.0)
+        self.seek_slider = ttk.Scale(
+            controls,
+            from_=0.0,
+            to=1.0,
+            orient="horizontal",
+            variable=self.seek_var,
+            command=self._on_seek_drag,
+            state="disabled",
+        )
+        self.seek_slider.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+
+        self.time_label = ttk.Label(
+            controls, text="00:00 / 00:00", width=14, anchor="center"
+        )
+        self.time_label.grid(row=0, column=3, padx=(0, 8))
+
+        # Volume + mute
+        self.mute_var = tk.BooleanVar(value=False)
+        self.mute_button = ttk.Checkbutton(
+            controls, text="Mute", variable=self.mute_var,
+            command=self._on_mute_toggle, state="disabled",
+        )
+        self.mute_button.grid(row=0, column=4, padx=(0, 4))
+
+        self.volume_var = tk.DoubleVar(value=1.0)
+        self.volume_slider = ttk.Scale(
+            controls,
+            from_=0.0,
+            to=1.0,
+            orient="horizontal",
+            variable=self.volume_var,
+            command=self._on_volume_change,
+            length=90,
+            state="disabled",
+        )
+        self.volume_slider.grid(row=0, column=5)
 
     def _build_timeline(self, parent: ttk.Widget) -> None:
         # 4. Timeline
