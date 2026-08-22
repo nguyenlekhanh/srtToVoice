@@ -99,10 +99,14 @@ def is_valid_wav(wav_path: Path) -> bool:
         return False
 
 
-def play_wav_blocking(wav_path: Path) -> None:
-    """Play a WAV file, blocking until it ends or is stopped.
+def play_wav_async(wav_path: Path) -> None:
+    """Start playing a WAV file and return immediately (non-blocking).
 
-    Uses winsound (Windows standard library, no extra dependencies).
+    Uses winsound (Windows standard library, no extra dependencies)
+    with ``SND_FILENAME | SND_ASYNC`` so playback runs asynchronously
+    and can be stopped from ANY thread via ``stop_sound()``
+    (``PlaySound(None, SND_PURGE)``). A blocking PlaySound could not
+    be interrupted cross-thread — that was Bug 1B.
     """
     try:
         import winsound
@@ -110,7 +114,9 @@ def play_wav_blocking(wav_path: Path) -> None:
         raise PreviewError(
             "Audio playback is not available on this platform."
         ) from exc
-    winsound.PlaySound(str(wav_path), winsound.SND_FILENAME)
+    winsound.PlaySound(
+        str(wav_path), winsound.SND_FILENAME | winsound.SND_ASYNC
+    )
 
 
 def stop_sound() -> None:

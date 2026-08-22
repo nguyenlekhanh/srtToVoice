@@ -24,6 +24,12 @@ class SrtError(Exception):
     """Human-readable SRT / voice generation failure (safe to show)."""
 
 
+# Seconds of silence Piper inserts between sentence chunks. Because
+# parse_srt_text joins cues into one line, each SRT cue becomes a
+# sentence chunk and gets this pause after it (except the last one).
+SENTENCE_SILENCE_SECONDS = 0.5
+
+
 # "00:00:01,000 --> 00:00:03,000" (also accepts '.' milliseconds and
 # trailing position metadata).
 _TIMESTAMP_RE = re.compile(
@@ -79,9 +85,11 @@ def parse_srt_text(srt_path: Path) -> str:
 
     Subtitle numbers and timestamps are removed; subtitle order and
     punctuation are preserved; multiline subtitle text is supported.
-    Subtitles are joined with blank lines. Raises SrtError with a
-    concise message when the file is missing, empty or has no text.
-    The original file is never modified.
+    Subtitles are joined with single spaces into ONE flowing narration
+    line, so Piper treats each cue as a separate sentence and the
+    ``--sentence-silence`` gap is applied between cues. Raises SrtError
+    with a concise message when the file is missing, empty or has no
+    text. The original file is never modified.
     """
     srt_path = Path(srt_path)
     if not srt_path.is_file():
@@ -100,7 +108,7 @@ def parse_srt_text(srt_path: Path) -> str:
 
     if not texts:
         raise SrtError("SRT contains no subtitle text.")
-    return "\n\n".join(texts)
+    return " ".join(texts)
 
 
 def new_voice_wav_path(generated_dir: Path) -> Path:
@@ -169,6 +177,8 @@ def generate_voice_wav(
             str(input_path),
             "-f",
             str(partial_path),
+            "--sentence-silence",
+            str(SENTENCE_SILENCE_SECONDS),
         ]
         popen_kwargs = {}
         if sys.platform == "win32":

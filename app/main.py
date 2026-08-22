@@ -84,7 +84,7 @@ from app.voice_preview import (
     PreviewError,
     generate_preview,
     is_valid_wav,
-    play_wav_blocking,
+    play_wav_async,
     preview_cache_path,
     stop_sound,
 )
@@ -149,6 +149,7 @@ class App(tk.Tk):
         self._preview_token = 0  # invalidates stale async callbacks
         self._generating = False
         self._playing = False
+        self._preview_after_id = None  # pending playback-completion timer
         # Thread-safe handoff: worker threads enqueue callbacks here and
         # the Tkinter main thread executes them via _poll_ui_queue().
         self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
@@ -159,6 +160,7 @@ class App(tk.Tk):
         self._voice_generating = False
         self._voice_playing = False
         self._voice_play_token = 0  # invalidates stale playback callbacks
+        self._voice_after_id = None  # pending playback-completion timer
 
         # Phase 4 state: uploaded video + preview player.
         self.video_path: Optional[Path] = None
@@ -597,31 +599,47 @@ class App(tk.Tk):
     def _start_playback(
         self, token: int, wav_path: Path, playing_status: str = "Playing..."
     ) -> None:
-        """Play the WAV in a background thread (winsound blocks)."""
+        """Start async winsound playback and schedule its completion.
+
+        Bug 1B fix: playback is non-blocking (``SND_FILENAME |
+        SND_ASYNC``), so no worker thread is needed and Stop Voice can
+        purge it from the UI thread. Completion is scheduled with Tk
+        ``after()`` using the probed WAV duration; the token check in
+        ``_on_playback_done`` discards the callback if Stop happened.
+        """
         self._playing = True
         self._set_preview_busy(True)
         self._set_preview_status(playing_status)
-        worker = threading.Thread(
-            target=self._playback_worker,
-            args=(token, wav_path),
-            daemon=True,
-        )
-        worker.start()
-
-    def _playback_worker(self, token: int, wav_path: Path) -> None:
-        error: Optional[str] = None
         try:
-            play_wav_blocking(wav_path)
+            duration = probe_wav_duration(wav_path)
+            play_wav_async(wav_path)
         except PreviewError as exc:
-            error = str(exc)
+            self._on_playback_done(token, str(exc))
+            return
         except Exception:
-            error = "Playback failed."
-        self._run_on_ui_thread(lambda: self._on_playback_done(token, error))
+            self._on_playback_done(token, "Playback failed.")
+            return
+        delay_ms = max(0, int(duration * 1000))
+        self._cancel_after("_preview_after_id")
+        self._preview_after_id = self.after(
+            delay_ms, lambda: self._on_playback_done(token, None)
+        )
+
+    def _cancel_after(self, attr: str) -> None:
+        """Cancel a pending ``after`` timer stored on ``attr`` (if any)."""
+        after_id = getattr(self, attr, None)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+            setattr(self, attr, None)
 
     def _on_playback_done(self, token: int, error: Optional[str]) -> None:
-        self._playing = False
         if token != self._preview_token:
-            return  # stopped or superseded
+            return  # stopped or superseded — never touch current state
+        self._preview_after_id = None
+        self._playing = False
         self._set_preview_busy(False)
         if error is not None:
             self._set_preview_status(error)
@@ -635,6 +653,7 @@ class App(tk.Tk):
         self._preview_token += 1  # invalidate pending worker callbacks
         self._generating = False
         self._playing = False
+        self._cancel_after("_preview_after_id")
         stop_sound()
         self._set_preview_busy(False)
         self._set_preview_status("Stopped.")
@@ -646,6 +665,7 @@ class App(tk.Tk):
             self._preview_token += 1
             self._generating = False
             self._playing = False
+            self._cancel_after("_preview_after_id")
             stop_sound()
             self._set_preview_busy(False)
             self._set_preview_status("")
@@ -827,7 +847,7 @@ class App(tk.Tk):
         self.asset_stop_button.pack(fill=tk.X, pady=(4, 0))
 
     def _on_play_asset(self, wav_path: Path) -> None:
-        """Play a generated WAV locally (blocking, on a worker thread)."""
+        """Play a generated WAV locally (async winsound, Bug 1B fix)."""
         if self._voice_playing:
             return
         if not is_valid_wav(wav_path):
@@ -839,28 +859,26 @@ class App(tk.Tk):
         self._voice_playing = True
         self._update_voice_controls()
         self._set_voice_status(f"Playing {wav_path.name}...")
-        threading.Thread(
-            target=self._asset_playback_worker,
-            args=(token, wav_path),
-            daemon=True,
-        ).start()
-
-    def _asset_playback_worker(self, token: int, wav_path: Path) -> None:
-        error: Optional[str] = None
         try:
-            play_wav_blocking(wav_path)
+            duration = probe_wav_duration(wav_path)
+            play_wav_async(wav_path)
         except PreviewError as exc:
-            error = str(exc)
+            self._on_asset_playback_done(token, str(exc))
+            return
         except Exception:
-            error = "Playback failed."
-        self._run_on_ui_thread(
-            lambda: self._on_asset_playback_done(token, error)
+            self._on_asset_playback_done(token, "Playback failed.")
+            return
+        delay_ms = max(0, int(duration * 1000))
+        self._cancel_after("_voice_after_id")
+        self._voice_after_id = self.after(
+            delay_ms, lambda: self._on_asset_playback_done(token, None)
         )
 
     def _on_asset_playback_done(self, token: int, error: Optional[str]) -> None:
-        self._voice_playing = False
         if token != self._voice_play_token:
-            return  # stopped or superseded
+            return  # stopped or superseded — never touch current state
+        self._voice_after_id = None
+        self._voice_playing = False
         self._update_voice_controls()
         if error is not None:
             self._set_voice_status(error)
@@ -871,6 +889,7 @@ class App(tk.Tk):
         """Stop generated-audio playback and cancel pending callbacks."""
         self._voice_play_token += 1
         self._voice_playing = False
+        self._cancel_after("_voice_after_id")
         stop_sound()
         self._update_voice_controls()
         self._set_voice_status("Stopped.")
@@ -1090,11 +1109,14 @@ class App(tk.Tk):
         self.video_player.set_muted(bool(self.mute_var.get()))
 
     def _on_close(self) -> None:
-        """Clean shutdown: stop video playback, then destroy the window."""
+        """Clean shutdown: stop all playback, then destroy the window."""
         try:
             self.after_cancel(self._poll_after_id)
         except Exception:
             pass
+        stop_sound()  # Bug 1B: purge any async winsound playback
+        self._cancel_after("_preview_after_id")
+        self._cancel_after("_voice_after_id")
         self._teardown_video_player()
         self.destroy()
 
