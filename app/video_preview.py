@@ -190,7 +190,12 @@ class VideoPlayer:
         self._playing = False
         self._paused = False
         self._stop_requested = False
-        self._seek_to: Optional[float] = None
+        # Bug 2: each worker has its OWN pending-seek slot. A single
+        # shared slot was consumed by whichever worker got there first,
+        # so the other worker never re-seeked its container (stale
+        # frames / silent or stalled audio after every timeline seek).
+        self._video_seek_to: Optional[float] = None
+        self._audio_seek_to: Optional[float] = None
         self._position = 0.0
         self._volume = 1.0
         self._muted = False
@@ -246,6 +251,20 @@ class VideoPlayer:
                 self._paused = False
                 self._video_start_wall = None  # re-anchor pacing clock
                 return
+            # Bug 2: a fresh start after playback reached the end must
+            # restart from the beginning; the stale audio clock would
+            # otherwise make the new playback fast-forward to the end.
+            if self._position >= self.duration:
+                self._position = 0.0
+            # Bug 2: re-anchor the sync clocks to the start position and
+            # enqueue initial seeks, so playback starts where the user
+            # seeked while stopped (previously the workers always opened
+            # the container at t=0 and the position snapped back to 0).
+            self._audio_clock = self._position
+            self._audio_ready = False
+            if self._position > 0.0:
+                self._video_seek_to = self._position
+                self._audio_seek_to = self._position
             self._playing = True
             self._paused = False
             self._stop_requested = False
@@ -259,6 +278,10 @@ class VideoPlayer:
             if not self._playing:
                 return
             self._paused = True
+        # Bug 2: discard the audio already buffered in the output stream
+        # so sound stops immediately on pause (no buffered tail keeps
+        # playing). The workers hold their current frame while paused.
+        self._flush_audio_stream()
 
     def stop(self) -> None:
         """Stop playback and reset to the beginning."""
@@ -271,7 +294,8 @@ class VideoPlayer:
             self._position = 0.0
             self._audio_clock = 0.0
             self._audio_ready = False
-            self._seek_to = None
+            self._video_seek_to = None
+            self._audio_seek_to = None
             self._video_start_wall = None
             self._video_start_pts = None
 
@@ -281,11 +305,17 @@ class VideoPlayer:
         with self._lock:
             self._position = seconds
             if self._playing:
-                self._seek_to = seconds
+                # Bug 2: enqueue the seek for BOTH workers so each one
+                # re-seeks its own container (the old single shared slot
+                # was consumed by only one of the two). Each worker
+                # drops content before the target instead of playing it.
+                self._video_seek_to = seconds
+                self._audio_seek_to = seconds
             else:
                 # Not playing: remember the position; playback starts
                 # from there when the user presses Play.
                 self._audio_clock = seconds
+                self._audio_ready = False
                 self._video_start_wall = None
                 self._video_start_pts = None
 
@@ -357,10 +387,11 @@ class VideoPlayer:
                 return 0.0
             return self._volume
 
-    def _consume_seek(self) -> Optional[float]:
+    def _consume_seek(self, attr: str) -> Optional[float]:
+        """Pop the pending seek for ONE worker (Bug 2: per-worker slot)."""
         with self._lock:
-            target = self._seek_to
-            self._seek_to = None
+            target = getattr(self, attr)
+            setattr(self, attr, None)
             return target
 
     def _should_quit(self) -> bool:
@@ -402,21 +433,31 @@ class VideoPlayer:
 
             self._open_audio_stream()
 
+            # Bug 2: content decoded between the seek keyframe and the
+            # seek target is dropped instead of played (no stale burst).
+            drop_until: Optional[float] = None
+
             while not self._should_quit():
                 if not self._wait_while_paused():
                     break
 
-                seek_target = self._consume_seek()
+                seek_target = self._consume_seek("_audio_seek_to")
                 if seek_target is not None:
                     self._flush_audio_stream()
+                    # Bug 2: with ``stream=`` the offset is in STREAM
+                    # time_base units, not AV_TIME_BASE microseconds
+                    # (``av.time_base`` is 1000000). The old
+                    # ``int(target * av.time_base)`` seeked ~1000x past
+                    # EOF, so the stream ended instantly after a seek.
                     container.seek(
-                        int(seek_target * av.time_base),
+                        int(seek_target / float(stream.time_base)),
                         stream=stream,
                         any_frame=False,
                     )
                     with self._lock:
                         self._audio_clock = seek_target
                         self._audio_ready = True
+                    drop_until = seek_target
 
                 packet = next(container.demux(stream), None)
                 if packet is None:
@@ -434,6 +475,23 @@ class VideoPlayer:
                         return
                     if not self._wait_while_paused():
                         return
+                    with self._lock:
+                        seek_pending = self._audio_seek_to is not None
+                    if seek_pending:
+                        break  # handle the new seek in the outer loop
+
+                    # Bug 2: drop frames that end before the seek target.
+                    if drop_until is not None:
+                        frame_end = None
+                        if frame.pts is not None:
+                            frame_end = float(
+                                frame.pts * frame.time_base
+                            ) + float(frame.samples) / float(
+                                frame.sample_rate
+                            )
+                        if frame_end is not None and frame_end <= drop_until:
+                            continue  # pre-target: drop, clock unchanged
+                        drop_until = None
 
                     # Wait until the video clock has nearly caught up
                     # with this audio chunk (keeps A/V in sync).
@@ -442,13 +500,22 @@ class VideoPlayer:
                             paused = self._paused
                             video_clock = self._position
                             audio_clock = self._audio_clock
-                        if paused:
+                            seek_pending = self._audio_seek_to is not None
+                        if paused or seek_pending:
                             break
                         if audio_clock - video_clock < _MAX_AV_DRIFT:
                             break
                         time.sleep(0.005)
                     if self._should_quit():
                         return
+                    with self._lock:
+                        seek_pending = self._audio_seek_to is not None
+                    if seek_pending:
+                        # Bug 2 (RC4): a seek arrived while this pre-seek
+                        # frame was waiting for the video clock. Drop it
+                        # without writing or advancing the audio clock;
+                        # the seek is handled in the outer loop.
+                        break
 
                     try:
                         resampled_list = resampler.resample(frame)
@@ -488,7 +555,10 @@ class VideoPlayer:
         stream, self._audio_stream = self._audio_stream, None
         if stream is not None:
             try:
-                stream.stop()
+                # Bug 2 (RC5): abort() discards pending buffers; stop()
+                # would wait for them to play out (audible tail after
+                # stop/close).
+                stream.abort()
                 stream.close()
             except Exception:
                 pass
@@ -497,7 +567,10 @@ class VideoPlayer:
         stream = self._audio_stream
         if stream is not None:
             try:
-                stream.stop()
+                # Bug 2 (RC5): abort() drops the already-buffered audio
+                # immediately; stop() would drain it first (tail keeps
+                # playing after pause/seek).
+                stream.abort()
                 stream.start()
             except Exception:
                 pass
@@ -541,18 +614,33 @@ class VideoPlayer:
         container = av.open(str(self.info.path), mode="r")
         try:
             stream = container.streams.video[0]
-            stream.thread_type = "AUTO"
+            # Bug 2: do NOT use frame threading ("AUTO") on this stream.
+            # After container.seek() the frame-threaded decoder reports
+            # end-of-stream after only a few frames (probe: seek to 1.5 s
+            # yielded 3 frames with AUTO vs 15 with NONE), which killed
+            # the video worker and snapped playback to the end after
+            # every timeline seek. Single-threaded decode is fast enough
+            # for preview playback.
+            stream.thread_type = "NONE"
             time_base = float(stream.time_base)
 
             last_tick = 0.0
+            # Bug 2: frames decoded between the seek keyframe and the
+            # seek target are dropped instead of shown (no stale flash).
+            drop_until: Optional[float] = None
             while not self._should_quit():
                 if not self._wait_while_paused():
                     break
 
-                seek_target = self._consume_seek()
+                seek_target = self._consume_seek("_video_seek_to")
                 if seek_target is not None:
+                    # Bug 2: with ``stream=`` the offset is in STREAM
+                    # time_base units, not AV_TIME_BASE microseconds
+                    # (``av.time_base`` is 1000000). The old
+                    # ``int(target * av.time_base)`` seeked ~1000x past
+                    # EOF, so the stream ended instantly after a seek.
                     container.seek(
-                        int(seek_target * av.time_base),
+                        int(seek_target / float(stream.time_base)),
                         stream=stream,
                         any_frame=False,
                     )
@@ -561,6 +649,7 @@ class VideoPlayer:
                         self._audio_clock = seek_target
                         self._video_start_wall = None
                         self._video_start_pts = None
+                    drop_until = seek_target
 
                 frame = self._decode_next_frame(container, stream)
                 if frame is None:
@@ -571,6 +660,12 @@ class VideoPlayer:
                     float(pts * time_base) if pts is not None else None
                 )
 
+                # Bug 2: drop frames that end before the seek target.
+                if drop_until is not None and frame_time is not None:
+                    if frame_time < drop_until:
+                        continue  # pre-target: skip, position unchanged
+                    drop_until = None
+
                 # Sync: wait until the reference clock (audio clock, or
                 # wall clock when there is no audio) reaches this
                 # frame's timestamp.
@@ -579,6 +674,12 @@ class VideoPlayer:
                         break
                     with self._lock:
                         if self._paused or self._should_quit():
+                            continue
+                        if self._video_seek_to is not None:
+                            # Bug 2 (RC4): a seek arrived while this
+                            # pre-seek frame was waiting to be shown.
+                            # Drop it (do not update the position); the
+                            # seek is handled at the top of the loop.
                             continue
                         self._position = frame_time
 

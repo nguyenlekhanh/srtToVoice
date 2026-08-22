@@ -167,6 +167,7 @@ class App(tk.Tk):
         self.video_player: Optional[VideoPlayer] = None
         self._video_photo: Optional[ImageTk.PhotoImage] = None  # keep ref
         self._video_seek_pending = False  # suppress seek-slider feedback
+        self._seek_after_id = None  # pending seek-settle timer (RC6)
         self._video_tick_token = 0  # invalidates stale tick callbacks
 
         # Phase 5 state: non-destructive timeline model (metadata only).
@@ -972,6 +973,10 @@ class App(tk.Tk):
             self.video_player.close()
             self.video_player = None
         self._video_tick_token += 1
+        # Bug 2 (RC6): discard any pending seek-settle timer so it does
+        # not fire against a different (or no) player.
+        self._cancel_after("_seek_after_id")
+        self._video_seek_pending = False
 
     def _set_video_controls_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
@@ -1025,8 +1030,13 @@ class App(tk.Tk):
     ) -> None:
         if token != self._video_tick_token:
             return  # superseded by a newer video
+        # Bug 2 (RC6): while a seek is settling, ignore ticks entirely —
+        # pre-seek ticks would otherwise snap the time label and the
+        # timeline playhead back to the old position (visible jump).
+        if self._video_seek_pending:
+            return
         self._update_time_label(position, duration)
-        if not self._video_seek_pending and duration > 0:
+        if duration > 0:
             self.seek_var.set(position)
         # Phase 5: VideoPlayer is the single source of truth for the
         # current time; the timeline playhead only mirrors it.
@@ -1093,10 +1103,15 @@ class App(tk.Tk):
         self.timeline.set_playhead(target)
         self._update_playhead()
         # Allow tick updates to resume shortly after the seek settles.
-        self.after(150, self._clear_seek_pending)
+        # Bug 2 (RC6): track the timer so a rapid second seek cancels
+        # the first one (otherwise the first timer clears the pending
+        # flag before the second seek has settled).
+        self._cancel_after("_seek_after_id")
+        self._seek_after_id = self.after(150, self._clear_seek_pending)
 
     def _clear_seek_pending(self) -> None:
         self._video_seek_pending = False
+        self._seek_after_id = None  # timer has fired
 
     def _on_volume_change(self, _value: str) -> None:
         if self.video_player is None:
@@ -1507,7 +1522,9 @@ class App(tk.Tk):
             self._video_seek_pending = True
             self.seek_var.set(target)
             self.video_player.seek(target)
-            self.after(150, self._clear_seek_pending)
+            # Bug 2 (RC6): single tracked timer (see _on_seek_drag).
+            self._cancel_after("_seek_after_id")
+            self._seek_after_id = self.after(150, self._clear_seek_pending)
         self._set_status(f"Timeline seeked to {format_timecode(target)}.")
 
     def _edge_under_pointer(self, x: float, clip, g: dict) -> Optional[str]:
